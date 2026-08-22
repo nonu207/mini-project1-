@@ -13,9 +13,6 @@ typedef enum {
     TOKEN_OP_GT,       // >
     TOKEN_OP_GTGT,     // >>
     TOKEN_OP_LT,       // <
-    TOKEN_OP_LTLT,     // <<
-    TOKEN_OP_AMPAMP,   // &&
-    TOKEN_OP_PIPEPIPE, // ||
     TOKEN_OP_SEMI      // ;
 } TokenType;
 
@@ -70,5 +67,33 @@ void free_tokens(TokenList *token_list);
  * @param token_list: Pointer to TokenList structure to print
  */
 void print_tokens(const TokenList *token_list);
+
+/**
+ * Validate that the token list conforms to the shell's right-linear grammar:
+ *
+ *   LINE  ->  epsilon
+ *         |   WORD ARG
+ *
+ *   ARG   ->  epsilon
+ *         |   WORD    ARG
+ *         |   OP_LT   TGT
+ *         |   OP_GT   TGT
+ *         |   OP_GTGT TGT
+ *         |   OP_PIPE CMD
+ *         |   OP_SEMI CMD
+ *         |   OP_AMP  BG
+ *
+ *   CMD   ->  WORD ARG
+ *   TGT   ->  WORD ARG
+ *
+ *   BG    ->  epsilon
+ *         |   WORD ARG
+ *
+ * On error, prints: cshell: invalid syntax
+ *
+ * @param token_list: Token linked list produced by tokenize()
+ * @return: 0 if grammar is valid, -1 if a grammar rule is violated
+ */
+int validate_grammar(const TokenList *token_list);
 
 #endif // LEXER_H
