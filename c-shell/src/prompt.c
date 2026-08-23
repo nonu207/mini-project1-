@@ -1,8 +1,4 @@
-#include "prompt.h"
-#include <pwd.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
+#include "shell.h"
 
 /* The directory where the shell was started — this is the shell's "home". */
 static char shell_home[1024] = "";

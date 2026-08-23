@@ -1,14 +1,4 @@
-#include "reveal.h"
-#include "change_dir.h" /* get_prev_path() */
-#include "prompt.h"    /* get_shell_home() */
-
-#include <dirent.h>
-#include <limits.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "shell.h"
 
 /* ------------------------------------------------------------------ */
 /* Internal: resolve a path argument using hop's rules (no frecency). */

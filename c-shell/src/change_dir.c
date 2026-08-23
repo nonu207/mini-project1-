@@ -1,11 +1,4 @@
-#include "change_dir.h"
-#include "prompt.h"  /* get_shell_home() */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h> /* stat(), S_ISDIR() for prune_db */
-#include <unistd.h>
+#include "shell.h"
 
 /* ------------------------------------------------------------------ */
 /* Internal state                                                       */

@@ -1,8 +1,4 @@
-#include "lexer.h"
-#include <ctype.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "shell.h"
 
 const char *token_type_name(TokenType type) {
   switch (type) {
