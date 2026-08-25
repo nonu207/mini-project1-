@@ -44,18 +44,8 @@ To start the shell, simply run the compiled binary:
 ./shell.out
 ```
 
-## Running Tests
-
-The project includes a comprehensive test suite for the lexer and grammar validator to ensure robust token parsing and strict adherence to the grammar rules.
-
-To run the lexer tests:
-```bash
-gcc -std=c23 -Iinclude src/lexer.c tests/test_lexer.c -o test_lexer.out
-./test_lexer.out
-```
 
 ## Structure
 
 * `src/` - Contains the source code (`main.c`, `lexer.c`, `exec.c`, `prompt.c`, etc.)
 * `include/` - Contains the header files (`lexer.h`, `prompt.h`, etc.)
-* `tests/` - Contains test files ensuring robustness of individual modules.
