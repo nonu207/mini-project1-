@@ -1,63 +1,61 @@
-# Mini Project 1 — CS3.301 Operating Systems and Networks
+# C-Shell (Mini Project)
 
-This repository contains the implementation for **Mini Project 1** of CS3.301 Operating Systems and Networks.
+C-Shell is a custom, lightweight shell written in C that parses and executes user commands. It implements a fully-featured lexer and a right-linear grammar validator, supporting advanced command-line features such as pipes, redirections, background execution, and quoting.
 
-## Repository Structure
+## Features
 
-```
-mini-project1/
-├── README.md                          # Root documentation
-├── Mini Project 1 — CS3.301.pdf      # Specification document
-├── c-shell/                           # Part 1: C-Shell Implementation
-│   ├── Makefile                       # Build system for C-Shell (produces shell.out)
-│   ├── include/                       # C-Shell Header files
-│   │   ├── shell.h                    # Global definitions and shell context
-│   │   ├── prompt.h                   # Shell prompt formatting
-│   │   ├── lexer.h                    # Lexical tokens and tokenizer
-│   │   ├── parser.h                   # Grammar parser & command structure
-│   │   ├── intrinsics.h               # Builtins: hop, reveal, peek, locate
-│   │   ├── execute.h                  # Execution, redirection, & piping
-│   │   ├── jobs.h                     # Job control, background jobs, activities, resume, ping
-│   │   └── fun.h                      # Diagnostic builtins: spy, snoop
-│   └── src/                           # C-Shell Source code
-│       ├── main.c                     # REPL loop entry point
-│       ├── prompt.c                   # Prompt implementation
-│       ├── lexer.c                    # Lexer implementation (maximal munch)
-│       ├── parser.c                   # Grammar parser implementation
-│       ├── intrinsics.c               # Builtins implementation
-│       ├── execute.c                  # Execution & pipeline logic
-│       ├── jobs.c                     # Job tracking & terminal control
-│       └── fun.c                      # Proc & ptrace inspection
-└── xv6/                               # Part 2: xv6 MLFQ Scheduler
-    ├── Makefile                       # xv6 Makefile supporting SCHEDULER=MLFQ
-    ├── kernel/                        # xv6 Kernel source files
-    ├── user/                          # xv6 User programs (includes schedulertest.c)
-    ├── mkfs/                          # File system generator
-    └── report.md                      # MLFQ analysis & scheduler comparison report
-```
+* **Custom Prompt:** Displays the current user, system name, and current working directory relative to the home directory.
+* **Lexer & Grammar Validator:** Robust tokenization using maximal munch principles. Understands single quotes (literal), double quotes (escaped characters), and unquoted escapes. Rejects invalid grammar dynamically based on a right-linear grammar specification.
+* **Pipes & Redirections:** Supports `|`, `<`, `>`, and `>>` for composing complex command pipelines.
+* **Background Jobs:** Supports running commands in the background using `&`.
+* **Sequential Execution:** Supports chaining multiple commands using `;`.
 
-## Quick Start
+### Built-in Commands
 
-### Building & Running C-Shell
+1. **`change_dir` (cd):** Navigates the filesystem.
+2. **`peek`:** Reads standard input or files and outputs them (supports `-r` to reverse output).
+3. **`locate`:** Locates the binary of a given command (similar to `which`).
+4. **`reveal`:** Lists files and directories in a specified path (similar to `ls`).
+5. **Execution:** Can execute external system commands seamlessly.
+
+## Getting Started
+
+### Prerequisites
+* A C compiler (e.g., `gcc`)
+* `make`
+
+### Building the Shell
+
+The project comes with a `Makefile` for easy compilation.
 
 ```bash
 cd c-shell
+make clean
 make all
+```
+
+This will produce the `shell.out` binary.
+
+### Running the Shell
+
+To start the shell, simply run the compiled binary:
+
+```bash
 ./shell.out
 ```
 
-To clean build artifacts:
+## Running Tests
+
+The project includes a comprehensive test suite for the lexer and grammar validator to ensure robust token parsing and strict adherence to the grammar rules.
+
+To run the lexer tests:
 ```bash
-make clean
+gcc -std=c23 -Iinclude src/lexer.c tests/test_lexer.c -o test_lexer.out
+./test_lexer.out
 ```
 
-### Building xv6 with MLFQ Scheduler
+## Structure
 
-```bash
-cd xv6
-# Build with default Round Robin scheduler
-make qemu
-
-# Build with MLFQ scheduler
-make qemu SCHEDULER=MLFQ
-```
+* `src/` - Contains the source code (`main.c`, `lexer.c`, `exec.c`, `prompt.c`, etc.)
+* `include/` - Contains the header files (`lexer.h`, `prompt.h`, etc.)
+* `tests/` - Contains test files ensuring robustness of individual modules.
