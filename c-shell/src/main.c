@@ -1,20 +1,24 @@
 #include "shell.h"
 
 /* ------------------------------------------------------------------ */
-/* Build a NULL-terminated argv[] array from a TokenList.             */
+/* Build a NULL-terminated argv[] from the FIRST command group only.   */
+/* Stops at the first TOKEN_OP_SEMI or TOKEN_OP_AMP (or end of list). */
 /* Caller must free() the returned pointer.                            */
 /* ------------------------------------------------------------------ */
-static char **tokens_to_argv(const TokenList *tokens, int *out_argc) {
-  /* Only include TOKEN_WORD tokens as argv entries */
+static char **extract_first_group(const TokenList *tokens, int *out_argc) {
+  /* Count words in the first command group (before any operator) */
   int word_count = 0;
   Token *t = tokens->head;
   while (t != NULL) {
+    if (t->type == TOKEN_OP_SEMI || t->type == TOKEN_OP_AMP ||
+        t->type == TOKEN_OP_LT  || t->type == TOKEN_OP_GT  ||
+        t->type == TOKEN_OP_GTGT || t->type == TOKEN_OP_PIPE)
+      break;
     if (t->type == TOKEN_WORD)
       word_count++;
     t = t->next;
   }
 
-  /* Allocate space for pointers + NULL sentinel */
   char **argv = malloc((word_count + 1) * sizeof(char *));
   if (argv == NULL)
     return NULL;
@@ -22,6 +26,10 @@ static char **tokens_to_argv(const TokenList *tokens, int *out_argc) {
   int i = 0;
   t = tokens->head;
   while (t != NULL) {
+    if (t->type == TOKEN_OP_SEMI || t->type == TOKEN_OP_AMP ||
+        t->type == TOKEN_OP_LT  || t->type == TOKEN_OP_GT  ||
+        t->type == TOKEN_OP_GTGT || t->type == TOKEN_OP_PIPE)
+      break;
     if (t->type == TOKEN_WORD)
       argv[i++] = t->value;
     t = t->next;
@@ -30,6 +38,77 @@ static char **tokens_to_argv(const TokenList *tokens, int *out_argc) {
 
   *out_argc = word_count;
   return argv;
+}
+
+/* ------------------------------------------------------------------ */
+/* Redirection helpers for built-in commands.                          */
+/* Applies < > >> from the token list to the shell's own fds.          */
+/* Returns 0 on success, -1 on error (caller must not run builtin).    */
+/* Caller must call undo_redirections() afterwards.                    */
+/* ------------------------------------------------------------------ */
+typedef struct {
+  int saved_stdin;
+  int saved_stdout;
+} SavedFds;
+
+static int apply_redirections(const TokenList *tokens, SavedFds *saved) {
+  saved->saved_stdin  = dup(STDIN_FILENO);
+  saved->saved_stdout = dup(STDOUT_FILENO);
+  int error = 0;
+
+  Token *t = tokens->head;
+  while (t != NULL) {
+    if (t->type == TOKEN_OP_SEMI || t->type == TOKEN_OP_AMP)
+      break;
+
+    if (t->type == TOKEN_OP_LT) {
+      t = t->next;
+      if (t == NULL || t->type != TOKEN_WORD) { error = 1; break; }
+      int fd = open(t->value, O_RDONLY);
+      if (fd < 0) {
+        fprintf(stderr, "cshell: no such file or directory\n");
+        error = 1;
+        break;
+      }
+      dup2(fd, STDIN_FILENO);
+      close(fd);
+    } else if (t->type == TOKEN_OP_GT || t->type == TOKEN_OP_GTGT) {
+      Token *op = t;
+      t = t->next;
+      if (t == NULL || t->type != TOKEN_WORD) { error = 1; break; }
+      int flags = O_WRONLY | O_CREAT;
+      if (op->type == TOKEN_OP_GTGT)
+        flags |= O_APPEND;
+      else
+        flags |= O_TRUNC;
+      int fd = open(t->value, flags, 0644);
+      if (fd < 0) {
+        fprintf(stderr, "cshell: unable to create file for writing\n");
+        error = 1;
+        break;
+      }
+      dup2(fd, STDOUT_FILENO);
+      close(fd);
+    }
+    t = t->next;
+  }
+
+  if (error) {
+    dup2(saved->saved_stdin, STDIN_FILENO);
+    dup2(saved->saved_stdout, STDOUT_FILENO);
+    close(saved->saved_stdin);
+    close(saved->saved_stdout);
+    return -1;
+  }
+  return 0;
+}
+
+static void undo_redirections(const SavedFds *saved) {
+  fflush(stdout);
+  dup2(saved->saved_stdout, STDOUT_FILENO);
+  close(saved->saved_stdout);
+  dup2(saved->saved_stdin, STDIN_FILENO);
+  close(saved->saved_stdin);
 }
 
 /* ------------------------------------------------------------------ */
@@ -78,15 +157,16 @@ int main(void) {
     if (tokens.head != NULL && tokens.head->type == TOKEN_WORD &&
         strcmp(tokens.head->value, "hop") == 0) {
 
-      /* Build argv from token list */
       int argc = 0;
-      char **argv = tokens_to_argv(&tokens, &argc);
+      char **argv = extract_first_group(&tokens, &argc);
 
       if (argv != NULL) {
-        hop(argc, argv, db, &db_size);
+        SavedFds saved;
+        if (apply_redirections(&tokens, &saved) == 0) {
+          hop(argc, argv, db, &db_size);
+          undo_redirections(&saved);
+        }
         free(argv);
-
-        /* Persist the updated frecency database */
         save_hop_db(db, db_size);
       }
 
@@ -99,9 +179,13 @@ int main(void) {
         strcmp(tokens.head->value, "reveal") == 0) {
 
       int argc = 0;
-      char **argv = tokens_to_argv(&tokens, &argc);
+      char **argv = extract_first_group(&tokens, &argc);
       if (argv != NULL) {
-        reveal(argc, argv);
+        SavedFds saved;
+        if (apply_redirections(&tokens, &saved) == 0) {
+          reveal(argc, argv);
+          undo_redirections(&saved);
+        }
         free(argv);
       }
       free_tokens(&tokens);
@@ -112,13 +196,14 @@ int main(void) {
         strcmp(tokens.head->value, "peek") == 0) {
 
       int argc = 0;
-      char **argv = tokens_to_argv(&tokens, &argc);
+      char **argv = extract_first_group(&tokens, &argc);
       if (argv != NULL) {
-        peek(argc, argv);
+        SavedFds saved;
+        if (apply_redirections(&tokens, &saved) == 0) {
+          peek(argc, argv);
+          undo_redirections(&saved);
+        }
         free(argv);
-
-        /* If peek consumed stdin until EOF, clear the EOF flag
-         * so the shell's main loop doesn't immediately exit. */
         clearerr(stdin);
       }
       free_tokens(&tokens);
@@ -129,18 +214,43 @@ int main(void) {
         strcmp(tokens.head->value, "locate") == 0) {
 
       int argc = 0;
-      char **argv = tokens_to_argv(&tokens, &argc);
+      char **argv = extract_first_group(&tokens, &argc);
       if (argv != NULL) {
-        locate(argc, argv);
+        SavedFds saved;
+        if (apply_redirections(&tokens, &saved) == 0) {
+          locate(argc, argv);
+          undo_redirections(&saved);
+        }
         free(argv);
       }
       free_tokens(&tokens);
       continue;
     }
 
-    /* print_tokens(&tokens); */
+    /* STEP 8: Execute external command or pipeline */
+    {
+      int has_pipe = 0;
+      for (Token *t = tokens.head; t != NULL; t = t->next) {
+        if (t->type == TOKEN_OP_SEMI || t->type == TOKEN_OP_AMP)
+          break;
+        if (t->type == TOKEN_OP_PIPE) {
+          has_pipe = 1;
+          break;
+        }
+      }
 
-    /* STEP 8: Clean up */
+      if (has_pipe) {
+        execute_pipeline(&tokens);
+      } else {
+        int argc = 0;
+        char **argv = extract_first_group(&tokens, &argc);
+        if (argv != NULL && argc > 0) {
+          execute_command(argc, argv, &tokens);
+          free(argv);
+        }
+      }
+    }
+
     free_tokens(&tokens);
   }
 
