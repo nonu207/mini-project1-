@@ -445,6 +445,8 @@ static int apply_segment_redirs(Token *start, Token *end) {
 /* Tokens are scanned up to the first ; or & or end of list.           */
 /* ------------------------------------------------------------------ */
 void execute_pipeline(const TokenList *tokens) {
+  void (*old_handler)(int) = signal(SIGPIPE, SIG_IGN);
+
   /* ── 1. Count segments (commands) separated by | ──────────────────── */
   int n_cmds = 1;
   for (Token *t = tokens->head; t != NULL; t = t->next) {
@@ -531,18 +533,32 @@ void execute_pipeline(const TokenList *tokens) {
     int argc = 0;
     char **argv = extract_segment_argv(seg_starts[i], seg_ends[i], &argc);
     if (argv == NULL || argc == 0) {
-      pids[i] = -1;
+      pids[i] = fork();
+      if (pids[i] < 0) { perror("fork"); pids[i] = -1; free(argv); continue; }
+      if (pids[i] == 0) _exit(0);
       free(argv);
       continue;
     }
 
-    char *resolved = resolve_command(argv[0]);
-    if (resolved == NULL) {
-      const char *display = (argv[0][0] == '%') ? argv[0] + 1 : argv[0];
-      fprintf(stderr, "cshell: command not found (%s)\n", display);
-      free(argv);
-      pids[i] = -1;
-      continue;
+    /* ── Check if this segment is a built-in command ─────────────── */
+    int is_builtin = (strcmp(argv[0], "peek") == 0 ||
+                      strcmp(argv[0], "reveal") == 0 ||
+                      strcmp(argv[0], "locate") == 0 ||
+                      strcmp(argv[0], "hop") == 0);
+
+    char *resolved = NULL;
+    if (!is_builtin) {
+      resolved = resolve_command(argv[0]);
+      if (resolved == NULL) {
+        const char *display = (argv[0][0] == '%') ? argv[0] + 1 : argv[0];
+        fprintf(stderr, "cshell: command not found (%s)\n", display);
+        free(argv);
+
+        pids[i] = fork();
+        if (pids[i] < 0) { perror("fork"); pids[i] = -1; continue; }
+        if (pids[i] == 0) _exit(127);
+        continue;
+      }
     }
 
     pids[i] = fork();
@@ -569,6 +585,24 @@ void execute_pipeline(const TokenList *tokens) {
       if (apply_segment_redirs(seg_starts[i], seg_ends[i]) < 0)
         _exit(1);
 
+      if (is_builtin) {
+        /* Run the built-in directly in this child process */
+        if (strcmp(argv[0], "peek") == 0) {
+          peek(argc, argv);
+        } else if (strcmp(argv[0], "reveal") == 0) {
+          reveal(argc, argv);
+        } else if (strcmp(argv[0], "locate") == 0) {
+          locate(argc, argv);
+        } else if (strcmp(argv[0], "hop") == 0) {
+          HopEntry db[MAX_HOP_ENTRIES];
+          int db_size = 0;
+          load_hop_db(db, &db_size);
+          hop(argc, argv, db, &db_size);
+        }
+        fflush(stdout);
+        _exit(0);
+      }
+
       execve(resolved, argv, environ);
       perror("execve");
       _exit(1);
@@ -594,6 +628,7 @@ void execute_pipeline(const TokenList *tokens) {
   }
 
   /* ── 7. Cleanup ──────────────────────────────────────────────────── */
+  signal(SIGPIPE, old_handler);
   free(pids);
   if (pipefds)
     free(pipefds);

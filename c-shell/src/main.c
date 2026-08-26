@@ -153,8 +153,20 @@ int main(void) {
       continue;
     }
 
-    /* STEP 6: Dispatch built-in commands */
-    if (tokens.head != NULL && tokens.head->type == TOKEN_WORD &&
+    /* ── Helper: check for pipe in current command group ────────────── */
+    int first_group_has_pipe = 0;
+    for (Token *tp = tokens.head; tp != NULL; tp = tp->next) {
+      if (tp->type == TOKEN_OP_SEMI || tp->type == TOKEN_OP_AMP)
+        break;
+      if (tp->type == TOKEN_OP_PIPE) {
+        first_group_has_pipe = 1;
+        break;
+      }
+    }
+
+    /* STEP 6: Dispatch built-in commands (only when NOT in a pipeline) */
+    if (!first_group_has_pipe &&
+        tokens.head != NULL && tokens.head->type == TOKEN_WORD &&
         strcmp(tokens.head->value, "hop") == 0) {
 
       int argc = 0;
@@ -175,7 +187,8 @@ int main(void) {
     }
 
     /* STEP 7: Dispatch other built-in commands */
-    if (tokens.head != NULL && tokens.head->type == TOKEN_WORD &&
+    if (!first_group_has_pipe &&
+        tokens.head != NULL && tokens.head->type == TOKEN_WORD &&
         strcmp(tokens.head->value, "reveal") == 0) {
 
       int argc = 0;
@@ -192,7 +205,8 @@ int main(void) {
       continue;
     }
 
-    if (tokens.head != NULL && tokens.head->type == TOKEN_WORD &&
+    if (!first_group_has_pipe &&
+        tokens.head != NULL && tokens.head->type == TOKEN_WORD &&
         strcmp(tokens.head->value, "peek") == 0) {
 
       int argc = 0;
@@ -210,7 +224,8 @@ int main(void) {
       continue;
     }
 
-    if (tokens.head != NULL && tokens.head->type == TOKEN_WORD &&
+    if (!first_group_has_pipe &&
+        tokens.head != NULL && tokens.head->type == TOKEN_WORD &&
         strcmp(tokens.head->value, "locate") == 0) {
 
       int argc = 0;
