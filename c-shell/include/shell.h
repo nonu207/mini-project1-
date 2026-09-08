@@ -5,6 +5,8 @@
 #include "change_dir.h"
 #include "lexer.h"
 #include "exec.h"
+#include "seq.h"
+#include "bg.h"
 #include "prompt.h"
 #include "reveal.h"
 #include "peek.h"
@@ -13,13 +15,16 @@
 /* ── Standard library headers ─────────────────────────────────────── */
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <pwd.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>

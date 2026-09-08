@@ -1,6 +1,8 @@
 #ifndef EXEC_H
 #define EXEC_H
 
+#include <sys/types.h>
+
 /**
  * Resolve a command name to an executable path.
  *
@@ -19,16 +21,32 @@ char *resolve_command(const char *name);
  *
  * @param argc   Argument count (argv[0] is the command name)
  * @param argv   NULL-terminated argument vector
- * @param tokens Full token list (used to detect < > redirections)
+ * @param start  First token of this command group (scans up to ; or & or end)
+ * @return  0 on success; 1 if the command was not found
  */
-void execute_command(int argc, char **argv, const TokenList *tokens);
+int execute_command(int argc, char **argv, Token *start);
 
 /**
  * Execute a pipeline of commands connected by pipes.
  * Handles per-command < > redirections as well.
  *
- * @param tokens Full token list (stops at first ; or & or end)
+ * @param start  First token of this command group (scans up to ; or & or end)
+ * @return  0 if every pipeline stage was found; 1 otherwise
  */
-void execute_pipeline(const TokenList *tokens);
+int execute_pipeline(Token *start);
+
+/**
+ * Execute a pipeline in the background (non-blocking).
+ *
+ * Forks all pipeline stages and sets up their inter-process pipes, then
+ * returns WITHOUT waiting for any child to finish.  stdin of every child
+ * in the pipeline is redirected to /dev/null so the pipeline has no
+ * access to the terminal.
+ *
+ * @param start  First token of the command group (scans up to ; or & or end)
+ * @return  PID of the FIRST command in the pipeline (as required by the spec),
+ *          or 0 on error.
+ */
+pid_t execute_pipeline_bg(Token *start);
 
 #endif /* EXEC_H */
