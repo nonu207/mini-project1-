@@ -1,0 +1,6 @@
+# Build output
+shell.out
+*.o
+
+# macOS
+.DS_Store

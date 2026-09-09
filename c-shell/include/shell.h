@@ -11,6 +11,7 @@
 #include "reveal.h"
 #include "peek.h"
 #include "locate.h"
+#include "activities.h"
 
 /* ── Standard library headers ─────────────────────────────────────── */
 #include <ctype.h>

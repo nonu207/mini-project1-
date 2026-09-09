@@ -560,7 +560,8 @@ int execute_pipeline(Token *start) {
     int is_builtin = (strcmp(argv[0], "peek") == 0 ||
                       strcmp(argv[0], "reveal") == 0 ||
                       strcmp(argv[0], "locate") == 0 ||
-                      strcmp(argv[0], "hop") == 0);
+                      strcmp(argv[0], "hop") == 0 ||
+                      strcmp(argv[0], "activities") == 0);
 
     char *resolved = NULL;
     if (!is_builtin) {
@@ -612,6 +613,8 @@ int execute_pipeline(Token *start) {
           reveal(argc, argv);
         } else if (strcmp(argv[0], "locate") == 0) {
           locate(argc, argv);
+        } else if (strcmp(argv[0], "activities") == 0) {
+          activities(argc, argv);
         } else if (strcmp(argv[0], "hop") == 0) {
           HopEntry db[MAX_HOP_ENTRIES];
           int db_size = 0;
@@ -664,7 +667,29 @@ int execute_pipeline(Token *start) {
 /* wait for children.  stdin of every child is /dev/null so the        */
 /* pipeline has no terminal access.  Returns pid of the first command. */
 /* ------------------------------------------------------------------ */
-pid_t execute_pipeline_bg(Token *start) {
+/* ------------------------------------------------------------------ */
+/* record_bg_stage: remember one live pipeline stage for the job table. */
+/* Copies the name, because argv[0] points into Token storage that      */
+/* free_tokens() releases once the command finishes parsing.            */
+/* ------------------------------------------------------------------ */
+static void record_bg_stage(pid_t *out_pids, char (*out_names)[256],
+                            int out_cap, int *rec, pid_t pid,
+                            const char *name) {
+  if (out_pids == NULL || out_names == NULL || *rec >= out_cap)
+    return;
+  out_pids[*rec] = pid;
+  strncpy(out_names[*rec], name, 255);
+  out_names[*rec][255] = '\0';
+  (*rec)++;
+}
+
+pid_t execute_pipeline_bg(Token *start, pid_t *out_pids,
+                          char (*out_names)[256],
+                          int out_cap, int *out_count) {
+  int rec = 0;
+  if (out_count != NULL)
+    *out_count = 0;
+
   void (*old_handler)(int) = signal(SIGPIPE, SIG_IGN);
 
   /* ── 1. Count segments (commands) separated by | ─────────────────── */
@@ -750,13 +775,20 @@ pid_t execute_pipeline_bg(Token *start) {
     return 0;
   }
 
+  /* Every stage of a background pipeline shares one process group,
+     headed by the first command, so terminal signals skip all of them. */
+  pid_t pgid = 0;
+
   for (int i = 0; i < n_cmds; i++) {
     int argc = 0;
     char **argv = extract_segment_argv(seg_starts[i], seg_ends[i], &argc);
     if (argv == NULL || argc == 0) {
       pids[i] = fork();
       if (pids[i] < 0) { perror("fork"); pids[i] = -1; free(argv); continue; }
-      if (pids[i] == 0) _exit(0);
+      if (pids[i] == 0) { setpgid(0, pgid); _exit(0); }
+      if (pgid == 0) pgid = pids[i];
+      setpgid(pids[i], pgid);
+      record_bg_stage(out_pids, out_names, out_cap, &rec, pids[i], "?");
       free(argv);
       continue;
     }
@@ -764,7 +796,8 @@ pid_t execute_pipeline_bg(Token *start) {
     int is_builtin = (strcmp(argv[0], "peek") == 0 ||
                       strcmp(argv[0], "reveal") == 0 ||
                       strcmp(argv[0], "locate") == 0 ||
-                      strcmp(argv[0], "hop") == 0);
+                      strcmp(argv[0], "hop") == 0 ||
+                      strcmp(argv[0], "activities") == 0);
 
     char *resolved = NULL;
     if (!is_builtin) {
@@ -772,11 +805,20 @@ pid_t execute_pipeline_bg(Token *start) {
       if (resolved == NULL) {
         const char *display = (argv[0][0] == '%') ? argv[0] + 1 : argv[0];
         fprintf(stderr, "cshell: command not found (%s)\n", display);
+
+        /* Copy the name BEFORE freeing argv: the recording below would
+           otherwise read freed memory. */
+        char nf_name[256];
+        strncpy(nf_name, argv[0], sizeof(nf_name) - 1);
+        nf_name[sizeof(nf_name) - 1] = '\0';
         free(argv);
 
         pids[i] = fork();
         if (pids[i] < 0) { perror("fork"); pids[i] = -1; continue; }
-        if (pids[i] == 0) _exit(127);
+        if (pids[i] == 0) { setpgid(0, pgid); _exit(127); }
+        if (pgid == 0) pgid = pids[i];
+        setpgid(pids[i], pgid);
+        record_bg_stage(out_pids, out_names, out_cap, &rec, pids[i], nf_name);
         continue;
       }
     }
@@ -792,6 +834,8 @@ pid_t execute_pipeline_bg(Token *start) {
 
     if (pids[i] == 0) {
       /* ── Child ──────────────────────────────────────────────────── */
+      setpgid(0, pgid);
+
       int devnull = open("/dev/null", O_RDONLY);
       if (devnull >= 0) {
         dup2(devnull, STDIN_FILENO);
@@ -818,6 +862,8 @@ pid_t execute_pipeline_bg(Token *start) {
           reveal(argc, argv);
         } else if (strcmp(argv[0], "locate") == 0) {
           locate(argc, argv);
+        } else if (strcmp(argv[0], "activities") == 0) {
+          activities(argc, argv);
         } else if (strcmp(argv[0], "hop") == 0) {
           HopEntry db[MAX_HOP_ENTRIES];
           int db_size = 0;
@@ -833,6 +879,10 @@ pid_t execute_pipeline_bg(Token *start) {
       _exit(1);
     }
 
+    if (pgid == 0) pgid = pids[i];
+    setpgid(pids[i], pgid);
+    record_bg_stage(out_pids, out_names, out_cap, &rec, pids[i], argv[0]);
+
     free(resolved);
     free(argv);
   }
@@ -847,7 +897,11 @@ pid_t execute_pipeline_bg(Token *start) {
 
   signal(SIGPIPE, old_handler);
 
-  pid_t first_pid = (n_cmds > 0 && pids[0] > 0) ? pids[0] : 0;
+  /* out_pids[0] is the first stage that actually forked, and pgid was set
+     from that same pid, so the two always agree. */
+  if (out_count != NULL)
+    *out_count = rec;
+  pid_t result_pgid = (rec > 0) ? pgid : 0;
 
   /* ── 7. Cleanup ──────────────────────────────────────────────────── */
   free(pids);
@@ -856,5 +910,5 @@ pid_t execute_pipeline_bg(Token *start) {
   free(seg_starts);
   free(seg_ends);
 
-  return first_pid;
+  return result_pgid;
 }

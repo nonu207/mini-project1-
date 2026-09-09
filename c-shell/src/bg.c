@@ -3,10 +3,16 @@
 extern char **environ;
 
 /* ── Background job table ──────────────────────────────────────────── */
-#define MAX_BG_JOBS 256
+/* MAX_BG_JOBS / MAX_PROCS_PER_JOB and the BgJob/BgProc shapes live in   */
+/* bg.h, because activities.c needs them too.                            */
 
+/* Dense array: indices [0, n_jobs) are live, in launch order.  Keeping it
+   dense is what makes "oldest first" free for activities -- with the old
+   scan-for-a-free-slot scheme, slot order diverged from launch order as
+   soon as any job finished. */
 static BgJob bg_jobs[MAX_BG_JOBS];
-static int   bg_job_count = 0;
+static int   n_jobs          = 0;   /* live jobs */
+static int   next_job_number = 0;   /* monotonic; never decremented */
 
 /* ── SIGCHLD handler ───────────────────────────────────────────────── */
 /* A no-op handler is required so SIGCHLD interrupts blocking system    */
@@ -22,11 +28,9 @@ static void sigchld_handler(int sig) {
 /* ── Public API ────────────────────────────────────────────────────── */
 
 void init_bg(void) {
-  for (int i = 0; i < MAX_BG_JOBS; i++) {
-    bg_jobs[i].pid = 0;
-    bg_jobs[i].job_number = 0;
-    bg_jobs[i].command_name[0] = '\0';
-  }
+  memset(bg_jobs, 0, sizeof(bg_jobs));
+  n_jobs = 0;
+  next_job_number = 0;
 
   struct sigaction sa;
   sa.sa_handler = sigchld_handler;
@@ -35,49 +39,122 @@ void init_bg(void) {
   sigaction(SIGCHLD, &sa, NULL);
 }
 
-void register_bg_job(pid_t pid, const char *name) {
-  for (int i = 0; i < MAX_BG_JOBS; i++) {
-    if (bg_jobs[i].pid == 0) {
-      bg_jobs[i].pid = pid;
-      bg_jobs[i].job_number = ++bg_job_count;
-      if (name != NULL) {
-        strncpy(bg_jobs[i].command_name, name,
-                sizeof(bg_jobs[i].command_name) - 1);
-        bg_jobs[i].command_name[sizeof(bg_jobs[i].command_name) - 1] = '\0';
-      }
-      /* Spec: print "[job_number] process_id" to stdout, before any
-         output the command produces. */
-      printf("[%d] %d\n", bg_jobs[i].job_number, (int)pid);
-      fflush(stdout);
-      return;
-    }
+void register_bg_group(pid_t pgid, const pid_t *pids,
+                       char (*names)[BG_NAME_MAX], int n) {
+  if (n <= 0)
+    return;
+  if (n_jobs >= MAX_BG_JOBS) {
+    fprintf(stderr, "cshell: too many background jobs\n");
+    return;
   }
-  fprintf(stderr, "cshell: too many background jobs\n");
+  if (n > MAX_JOB_PROCS)
+    n = MAX_JOB_PROCS;  /* extra stages still run, just untracked */
+
+  BgJob *j = &bg_jobs[n_jobs++];
+  memset(j, 0, sizeof(*j));
+  j->job_number = ++next_job_number;
+  j->pgid       = pgid;
+  j->lead_pid   = pids[0];
+  j->nprocs     = n;
+
+  for (int i = 0; i < n; i++) {
+    j->procs[i].pid = pids[i];
+    strncpy(j->procs[i].command_name, names[i], BG_NAME_MAX - 1);
+    j->procs[i].command_name[BG_NAME_MAX - 1] = '\0';
+  }
+  strncpy(j->lead_name, names[0], BG_NAME_MAX - 1);
+  j->lead_name[BG_NAME_MAX - 1] = '\0';
+
+  /* Spec: print "[job_number] process_id" to stdout, before any output
+     the command produces.  For a pipeline that pid is the first stage. */
+  printf("[%d] %d\n", j->job_number, (int)j->lead_pid);
+  fflush(stdout);
 }
 
-void check_bg_jobs(void) {
+void register_bg_job(pid_t pid, const char *name) {
+  pid_t pids[1] = { pid };
+  char  names[1][BG_NAME_MAX];
+
+  names[0][0] = '\0';
+  if (name != NULL) {
+    strncpy(names[0], name, BG_NAME_MAX - 1);
+    names[0][BG_NAME_MAX - 1] = '\0';
+  }
+  /* A standalone command is a process group of one, and setpgid() made
+     its pgid equal to its own pid. */
+  register_bg_group(pid, pids, names, 1);
+}
+
+int check_bg_jobs(void) {
   int status;
   pid_t pid;
+  int reported = 0;
+
   while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-    for (int i = 0; i < MAX_BG_JOBS; i++) {
-      if (bg_jobs[i].pid == pid) {
+    for (int i = 0; i < n_jobs; i++) {
+      BgJob *j = &bg_jobs[i];
+
+      int found = -1;
+      for (int k = 0; k < j->nprocs; k++) {
+        if (j->procs[k].pid == pid) {
+          found = k;
+          break;
+        }
+      }
+      if (found < 0)
+        continue;
+
+      /* Remember the lead's verdict: it identifies the whole job, and it
+         may exit long before the last stage does. */
+      if (pid == j->lead_pid) {
+        j->lead_status = status;
+        j->lead_reaped = 1;
+      }
+      j->last_status = status;
+
+      /* Drop just this process, keeping the rest in pipeline order. */
+      for (int k = found; k < j->nprocs - 1; k++)
+        j->procs[k] = j->procs[k + 1];
+      j->nprocs--;
+
+      /* The job retires only once every process is gone. */
+      if (j->nprocs == 0) {
+        int st = j->lead_reaped ? j->lead_status : j->last_status;
         /* Spec: print to stdout (same stream as the prompt and [N] pid).
            Format: "<name> with pid <pid> exited normally"   (WIFEXITED)
                    "<name> with pid <pid> exited abnormally" (WIFSIGNALED)
-           Note: NO trailing period — the spec examples have none.     */
-        if (WIFEXITED(status)) {
+           Note: NO trailing period — the spec examples have none.
+           The name and pid are the lead's, so one line per job. */
+        if (WIFEXITED(st)) {
           printf("%s with pid %d exited normally\n",
-                 bg_jobs[i].command_name, (int)pid);
-        } else if (WIFSIGNALED(status)) {
+                 j->lead_name, (int)j->lead_pid);
+        } else if (WIFSIGNALED(st)) {
           printf("%s with pid %d exited abnormally\n",
-                 bg_jobs[i].command_name, (int)pid);
+                 j->lead_name, (int)j->lead_pid);
         }
         fflush(stdout);
-        bg_jobs[i].pid = 0;
-        break;
+        reported++;
+
+        for (int m = i; m < n_jobs - 1; m++)  /* keep the array dense */
+          bg_jobs[m] = bg_jobs[m + 1];
+        n_jobs--;
       }
+      break;  /* pids are unique across jobs */
     }
   }
+  return reported;
+}
+
+/* ── Enumeration for activities (different translation unit) ────────── */
+
+int bg_live_count(void) {
+  return n_jobs;
+}
+
+const BgJob *bg_job_at(int idx) {
+  if (idx < 0 || idx >= n_jobs)
+    return NULL;
+  return &bg_jobs[idx];
 }
 
 /* ── Extract argv up to TOKEN_OP_AMP (for background commands).       */
@@ -143,11 +220,12 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
   }
 
   if (has_pipe) {
-    pid_t pid = execute_pipeline_bg(start);
-    if (pid > 0) {
-      const char *name = start->value;
-      register_bg_job(pid, name);
-    }
+    pid_t pids[MAX_JOB_PROCS];
+    char  names[MAX_JOB_PROCS][BG_NAME_MAX];
+    int   n = 0;
+    pid_t pgid = execute_pipeline_bg(start, pids, names, MAX_JOB_PROCS, &n);
+    if (pgid > 0 && n > 0)
+      register_bg_group(pgid, pids, names, n);
     return 0;
   }
 
@@ -158,18 +236,26 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
     return 0;
   }
 
-  char *resolved = resolve_command(argv[0]);
-  if (resolved == NULL) {
-    const char *display = (argv[0][0] == '%') ? argv[0] + 1 : argv[0];
-    fprintf(stderr, "cshell: command not found (%s)\n", display);
-    free(argv);
-    return 0;
-  }
-
+  /* Decide builtin-ness BEFORE resolving a path: a builtin has no
+     executable on disk, so resolving first made "peek &", "reveal &",
+     "locate &" and "hop &" all fail with "command not found".  This
+     ordering matches execute_pipeline / execute_pipeline_bg. */
   int is_builtin = (strcmp(argv[0], "peek") == 0 ||
                     strcmp(argv[0], "reveal") == 0 ||
                     strcmp(argv[0], "locate") == 0 ||
-                    strcmp(argv[0], "hop") == 0);
+                    strcmp(argv[0], "hop") == 0 ||
+                    strcmp(argv[0], "activities") == 0);
+
+  char *resolved = NULL;
+  if (!is_builtin) {
+    resolved = resolve_command(argv[0]);
+    if (resolved == NULL) {
+      const char *display = (argv[0][0] == '%') ? argv[0] + 1 : argv[0];
+      fprintf(stderr, "cshell: command not found (%s)\n", display);
+      free(argv);
+      return 0;
+    }
+  }
 
   pid_t pid = fork();
   if (pid < 0) {
@@ -180,6 +266,12 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
   }
 
   if (pid == 0) {
+    /* Spec #12: a background job must not be tied to the terminal.
+       Terminal-generated signals (^C -> SIGINT, ^Z -> SIGTSTP) are sent
+       to the FOREGROUND process group, so give this job a group of its
+       own; otherwise ^C during a later foreground command kills it too. */
+    setpgid(0, 0);
+
     int devnull = open("/dev/null", O_RDONLY);
     if (devnull >= 0) {
       dup2(devnull, STDIN_FILENO);
@@ -197,6 +289,8 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
         reveal(argc, argv);
       } else if (strcmp(argv[0], "locate") == 0) {
         locate(argc, argv);
+      } else if (strcmp(argv[0], "activities") == 0) {
+        activities(argc, argv);
       } else if (strcmp(argv[0], "hop") == 0) {
         /* Load a fresh copy of the db; the child's chdir does not
            affect the parent shell's working directory anyway.      */
@@ -213,6 +307,10 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
     perror("execve");
     _exit(1);
   }
+
+  /* Set the group from the parent as well: whichever side runs first
+     wins, so the job is never briefly in the shell's group. */
+  setpgid(pid, pid);
 
   register_bg_job(pid, argv[0]);
   free(resolved);

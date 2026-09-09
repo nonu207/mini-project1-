@@ -28,12 +28,21 @@ static int read_input_line(char *input, size_t size) {
 
     if (errno == EINTR) {
       clearerr(stdin);
+
+      /* Spec #10: report completions as soon as they happen, even while
+         waiting for input.  This must run BEFORE the SIGINT check, or a
+         ^C arriving around the same time swallows the report. */
+      int reported = check_bg_jobs();
+
       if (sigint_received) {
         sigint_received = 0;
         input[0] = '\0';
         return 1;
       }
-      check_bg_jobs();
+
+      /* A report scrolled the prompt away; draw a fresh one. */
+      if (reported > 0)
+        display_prompt();
       continue;
     }
 
@@ -99,6 +108,14 @@ int main(void) {
 
     /* STEP 6: Execute the ;-separated sequence (see seq.c) */
     run_sequence(&tokens, db, &db_size);
+
+    /* A ^C during the foreground command set this flag; consume it here.
+       Left set, the next SIGCHLD-driven EINTR would be misread as a
+       SIGINT and would discard the user's line. */
+    if (sigint_received) {
+      sigint_received = 0;
+      printf("\n");
+    }
 
     free_tokens(&tokens);
 
