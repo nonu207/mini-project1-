@@ -12,6 +12,8 @@
 #include "peek.h"
 #include "locate.h"
 #include "activities.h"
+#include "resume.h"
+#include "term.h"
 
 /* ── Standard library headers ─────────────────────────────────────── */
 #include <ctype.h>

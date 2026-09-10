@@ -3,13 +3,65 @@
 extern char **environ;
 
 /* ------------------------------------------------------------------ */
-/* wait_for_child: block until pid is reaped.  Retries on EINTR so a   */
-/* SIGCHLD from a background job does not abort the foreground wait.   */
+/* child_default_signals: a job must react to the keyboard normally.   */
+/* The shell ignores/handles these; children must not inherit that.    */
 /* ------------------------------------------------------------------ */
-static void wait_for_child(pid_t pid) {
-  int status;
-  while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
-    ;
+static void child_default_signals(void) {
+  signal(SIGINT,  SIG_DFL);
+  signal(SIGTSTP, SIG_DFL);
+  signal(SIGTTOU, SIG_DFL);
+  signal(SIGTTIN, SIG_DFL);
+}
+
+/* ------------------------------------------------------------------ */
+/* fg_wait: wait for an entire foreground job, then take the terminal  */
+/* back.  WUNTRACED is what makes Ctrl-Z observable -- without it a    */
+/* stopped child never causes waitpid to return and the shell hangs.   */
+/*                                                                      */
+/* If the group was stopped it is handed to the job table so it gets a */
+/* job number, shows up in activities, and blocks Ctrl-D.  Only the    */
+/* processes that actually stopped are recorded: a stage that had      */
+/* already exited must not be resurrected as a stopped process.        */
+/* Returns 1 if the job stopped, 0 if every process finished.          */
+/* ------------------------------------------------------------------ */
+static int fg_wait(pid_t pgid, pid_t *pids, char (*names)[BG_NAME_MAX],
+                   int n, const char *cmdline) {
+  int sn = 0;
+  int interrupted = 0;
+
+  for (int i = 0; i < n; i++) {
+    if (pids[i] <= 0)
+      continue;
+    int status;
+    while (waitpid(pids[i], &status, WUNTRACED) < 0 && errno == EINTR)
+      ;
+    if (WIFSTOPPED(status)) {
+      /* Compact the survivors to the front, keeping pipeline order. */
+      pids[sn] = pids[i];
+      if (sn != i)
+        memcpy(names[sn], names[i], BG_NAME_MAX);
+      sn++;
+    } else if (WIFSIGNALED(status) && WTERMSIG(status) == SIGINT) {
+      interrupted = 1;
+    }
+  }
+
+  /* Spec: reclaim the terminal after the pipeline finishes OR stops. */
+  term_take();
+
+  /* The job owns the terminal now, so ^C goes to it and never to the
+     shell -- the shell must therefore end the "^C" line itself, or the
+     next line of output runs on from it. */
+  if (interrupted) {
+    printf("\n");
+    fflush(stdout);
+  }
+
+  if (sn > 0) {
+    register_stopped_job(pgid, pids, names, sn, cmdline);
+    return 1;
+  }
+  return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -236,14 +288,25 @@ int execute_command(int argc, char **argv, Token *start) {
       return 0;
     }
     if (pid == 0) {
-      signal(SIGINT, SIG_DFL);
-      signal(SIGTSTP, SIG_DFL);
+      setpgid(0, 0);              /* own group: ^C/^Z reach only this job */
+      child_default_signals();
       execve(resolved, argv, environ);
       perror("execve");
       _exit(1);
     }
+    setpgid(pid, pid);            /* race-free: both sides set it */
     free(resolved);
-    wait_for_child(pid);
+
+    pid_t pids[1] = { pid };
+    char  names[1][BG_NAME_MAX];
+    strncpy(names[0], argv[0], BG_NAME_MAX - 1);
+    names[0][BG_NAME_MAX - 1] = '\0';
+
+    char cmdline[BG_CMD_MAX];
+    token_group_to_string(start, cmdline, sizeof(cmdline));
+
+    term_give(pid);
+    fg_wait(pid, pids, names, 1, cmdline);
     return 0;
   }
 
@@ -274,8 +337,8 @@ int execute_command(int argc, char **argv, Token *start) {
 
   if (pid == 0) {
     /* ── Child ──────────────────────────────────────────────────────── */
-    signal(SIGINT, SIG_DFL);
-    signal(SIGTSTP, SIG_DFL);
+    setpgid(0, 0);
+    child_default_signals();
     if (has_input) {
       close(in_pipe[1]);
       dup2(in_pipe[0], STDIN_FILENO);
@@ -292,6 +355,8 @@ int execute_command(int argc, char **argv, Token *start) {
   }
 
   /* ── Parent ──────────────────────────────────────────────────────── */
+  setpgid(pid, pid);
+  term_give(pid);
   free(resolved);
 
   /* Feed input files to child's stdin */
@@ -327,7 +392,13 @@ int execute_command(int argc, char **argv, Token *start) {
     free(buf);
   }
 
-  wait_for_child(pid);
+  pid_t fg_pids[1] = { pid };
+  char  fg_names[1][BG_NAME_MAX];
+  strncpy(fg_names[0], argv[0], BG_NAME_MAX - 1);
+  fg_names[0][BG_NAME_MAX - 1] = '\0';
+  char fg_cmdline[BG_CMD_MAX];
+  token_group_to_string(start, fg_cmdline, sizeof(fg_cmdline));
+  fg_wait(pid, fg_pids, fg_names, 1, fg_cmdline);
   return 0;
 }
 
@@ -532,7 +603,8 @@ int execute_pipeline(Token *start) {
 
   /* ── 5. Fork children ────────────────────────────────────────────── */
   pid_t *pids = malloc(n_cmds * sizeof(pid_t));
-  if (pids == NULL) {
+  char (*names)[BG_NAME_MAX] = malloc(n_cmds * BG_NAME_MAX);
+  if (pids == NULL || names == NULL) {
     if (pipefds) {
       for (int i = 0; i < n_pipes; i++) {
         close(pipefds[i][0]);
@@ -540,28 +612,40 @@ int execute_pipeline(Token *start) {
       }
       free(pipefds);
     }
+    free(pids);
+    free(names);
     free(seg_starts);
     free(seg_ends);
     return 0;
   }
 
+  /* All stages share one process group headed by the first, so the
+     terminal can be handed to the pipeline as a unit. */
+  pid_t pgid = 0;
+
   for (int i = 0; i < n_cmds; i++) {
     int argc = 0;
+    names[i][0] = '\0';
     char **argv = extract_segment_argv(seg_starts[i], seg_ends[i], &argc);
     if (argv == NULL || argc == 0) {
       pids[i] = fork();
       if (pids[i] < 0) { perror("fork"); pids[i] = -1; free(argv); continue; }
-      if (pids[i] == 0) _exit(0);
+      if (pids[i] == 0) { setpgid(0, pgid); _exit(0); }
+      if (pgid == 0) pgid = pids[i];
+      setpgid(pids[i], pgid);
       free(argv);
       continue;
     }
+    strncpy(names[i], argv[0], BG_NAME_MAX - 1);
+    names[i][BG_NAME_MAX - 1] = '\0';
 
     /* ── Check if this segment is a built-in command ─────────────── */
     int is_builtin = (strcmp(argv[0], "peek") == 0 ||
                       strcmp(argv[0], "reveal") == 0 ||
                       strcmp(argv[0], "locate") == 0 ||
                       strcmp(argv[0], "hop") == 0 ||
-                      strcmp(argv[0], "activities") == 0);
+                      strcmp(argv[0], "activities") == 0 ||
+                    strcmp(argv[0], "resume") == 0);
 
     char *resolved = NULL;
     if (!is_builtin) {
@@ -574,7 +658,9 @@ int execute_pipeline(Token *start) {
 
         pids[i] = fork();
         if (pids[i] < 0) { perror("fork"); pids[i] = -1; continue; }
-        if (pids[i] == 0) _exit(127);
+        if (pids[i] == 0) { setpgid(0, pgid); _exit(127); }
+        if (pgid == 0) pgid = pids[i];
+        setpgid(pids[i], pgid);
         continue;
       }
     }
@@ -590,8 +676,8 @@ int execute_pipeline(Token *start) {
 
     if (pids[i] == 0) {
       /* ── Child ──────────────────────────────────────────────────── */
-      signal(SIGINT, SIG_DFL);
-      signal(SIGTSTP, SIG_DFL);
+      setpgid(0, pgid);
+      child_default_signals();
       if (i > 0)
         dup2(pipefds[i - 1][0], STDIN_FILENO);
       if (i < n_pipes)
@@ -615,6 +701,8 @@ int execute_pipeline(Token *start) {
           locate(argc, argv);
         } else if (strcmp(argv[0], "activities") == 0) {
           activities(argc, argv);
+        } else if (strcmp(argv[0], "resume") == 0) {
+          resume(argc, argv);
         } else if (strcmp(argv[0], "hop") == 0) {
           HopEntry db[MAX_HOP_ENTRIES];
           int db_size = 0;
@@ -630,6 +718,9 @@ int execute_pipeline(Token *start) {
       _exit(1);
     }
 
+    if (pgid == 0) pgid = pids[i];
+    setpgid(pids[i], pgid);
+
     free(resolved);
     free(argv);
   }
@@ -642,14 +733,18 @@ int execute_pipeline(Token *start) {
     }
   }
 
-  for (int i = 0; i < n_cmds; i++) {
-    if (pids[i] > 0)
-      wait_for_child(pids[i]);
-  }
+  /* Spec: give the pipeline the terminal before waiting on it, and take
+     it back afterwards (fg_wait does the reclaim). */
+  char cmdline[BG_CMD_MAX];
+  token_group_to_string(start, cmdline, sizeof(cmdline));
+
+  term_give(pgid);
+  fg_wait(pgid, pids, names, n_cmds, cmdline);
 
   /* ── 7. Cleanup ──────────────────────────────────────────────────── */
   signal(SIGPIPE, old_handler);
   free(pids);
+  free(names);
   if (pipefds)
     free(pipefds);
   free(seg_starts);
@@ -797,7 +892,8 @@ pid_t execute_pipeline_bg(Token *start, pid_t *out_pids,
                       strcmp(argv[0], "reveal") == 0 ||
                       strcmp(argv[0], "locate") == 0 ||
                       strcmp(argv[0], "hop") == 0 ||
-                      strcmp(argv[0], "activities") == 0);
+                      strcmp(argv[0], "activities") == 0 ||
+                    strcmp(argv[0], "resume") == 0);
 
     char *resolved = NULL;
     if (!is_builtin) {
@@ -864,6 +960,8 @@ pid_t execute_pipeline_bg(Token *start, pid_t *out_pids,
           locate(argc, argv);
         } else if (strcmp(argv[0], "activities") == 0) {
           activities(argc, argv);
+        } else if (strcmp(argv[0], "resume") == 0) {
+          resume(argc, argv);
         } else if (strcmp(argv[0], "hop") == 0) {
           HopEntry db[MAX_HOP_ENTRIES];
           int db_size = 0;

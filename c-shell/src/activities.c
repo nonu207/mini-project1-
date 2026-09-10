@@ -99,9 +99,13 @@ void activities(int argc, char **argv) {
       if (procfs_available() && proc_state_char(pid) == 0)
         continue;
 
+      /* A job the shell itself suspended is known Stopped without
+         asking procfs -- which is also the only way the state is right
+         on systems with no /proc. */
+      const char *state = j->stopped ? "Stopped" : proc_state_string(pid);
+
       /* Two-space indent, space-separated; no column alignment. */
-      printf("  %d %s %s\n", (int)pid, j->procs[k].command_name,
-             proc_state_string(pid));
+      printf("  %d %s %s\n", (int)pid, j->procs[k].command_name, state);
     }
   }
 

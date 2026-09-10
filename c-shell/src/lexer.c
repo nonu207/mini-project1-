@@ -456,3 +456,41 @@ int validate_grammar(const TokenList *token_list) {
   curr = curr->next; /* consume leading WORD */
   return parse_arg(&curr);
 }
+
+/* ------------------------------------------------------------------ */
+/* token_group_to_string: rebuild a group's command line as written.   */
+/* ------------------------------------------------------------------ */
+static const char *op_text(TokenType type) {
+  switch (type) {
+  case TOKEN_OP_PIPE: return "|";
+  case TOKEN_OP_GT:   return ">";
+  case TOKEN_OP_GTGT: return ">>";
+  case TOKEN_OP_LT:   return "<";
+  default:            return NULL;
+  }
+}
+
+void token_group_to_string(Token *start, char *out, size_t size) {
+  if (out == NULL || size == 0)
+    return;
+  out[0] = '\0';
+
+  size_t len = 0;
+  for (Token *t = start; t != NULL; t = t->next) {
+    if (t->type == TOKEN_OP_SEMI || t->type == TOKEN_OP_AMP)
+      break;
+
+    const char *piece = (t->type == TOKEN_WORD) ? t->value : op_text(t->type);
+    if (piece == NULL)
+      continue;
+
+    size_t plen = strlen(piece);
+    if (len + plen + (len ? 1 : 0) + 1 > size)
+      break;                      /* truncate rather than overflow */
+    if (len)
+      out[len++] = ' ';
+    memcpy(out + len, piece, plen);
+    len += plen;
+    out[len] = '\0';
+  }
+}

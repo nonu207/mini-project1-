@@ -39,13 +39,16 @@ void init_bg(void) {
   sigaction(SIGCHLD, &sa, NULL);
 }
 
-void register_bg_group(pid_t pgid, const pid_t *pids,
-                       char (*names)[BG_NAME_MAX], int n) {
+/* Append a job to the table and fill it in.  Shared by the background
+   and the Ctrl-Z paths, which differ only in what they print. */
+static BgJob *add_job(pid_t pgid, const pid_t *pids,
+                      char (*names)[BG_NAME_MAX], int n,
+                      const char *cmdline) {
   if (n <= 0)
-    return;
+    return NULL;
   if (n_jobs >= MAX_BG_JOBS) {
     fprintf(stderr, "cshell: too many background jobs\n");
-    return;
+    return NULL;
   }
   if (n > MAX_JOB_PROCS)
     n = MAX_JOB_PROCS;  /* extra stages still run, just untracked */
@@ -65,13 +68,61 @@ void register_bg_group(pid_t pgid, const pid_t *pids,
   strncpy(j->lead_name, names[0], BG_NAME_MAX - 1);
   j->lead_name[BG_NAME_MAX - 1] = '\0';
 
+  /* Fall back to the bare command name if no command line was captured. */
+  const char *cl = (cmdline != NULL && cmdline[0] != '\0') ? cmdline
+                                                           : j->lead_name;
+  strncpy(j->cmdline, cl, BG_CMD_MAX - 1);
+  j->cmdline[BG_CMD_MAX - 1] = '\0';
+  return j;
+}
+
+void register_bg_group(pid_t pgid, const pid_t *pids,
+                       char (*names)[BG_NAME_MAX], int n,
+                       const char *cmdline) {
+  BgJob *j = add_job(pgid, pids, names, n, cmdline);
+  if (j == NULL)
+    return;
   /* Spec: print "[job_number] process_id" to stdout, before any output
      the command produces.  For a pipeline that pid is the first stage. */
   printf("[%d] %d\n", j->job_number, (int)j->lead_pid);
   fflush(stdout);
 }
 
-void register_bg_job(pid_t pid, const char *name) {
+void register_stopped_job(pid_t pgid, const pid_t *pids,
+                          char (*names)[BG_NAME_MAX], int n,
+                          const char *cmdline) {
+  BgJob *j = add_job(pgid, pids, names, n, cmdline);
+  if (j == NULL)
+    return;
+  j->stopped = 1;
+  /* Spec: "[job_number] + Stopped command" */
+  printf("[%d] + Stopped %s\n", j->job_number, j->cmdline);
+  fflush(stdout);
+}
+
+int bg_has_stopped(void) {
+  for (int i = 0; i < n_jobs; i++)
+    if (bg_jobs[i].stopped)
+      return 1;
+  return 0;
+}
+
+void bg_hangup_all(void) {
+  for (int i = 0; i < n_jobs; i++) {
+    if (bg_jobs[i].nprocs <= 0)
+      continue;
+    /* Negative pid == "the whole process group". */
+    kill(-bg_jobs[i].pgid, SIGHUP);
+    /* A stopped process cannot act on SIGHUP until it runs again, so
+       wake it -- otherwise the hangup would never take effect and the
+       job would outlive the shell. */
+    if (bg_jobs[i].stopped)
+      kill(-bg_jobs[i].pgid, SIGCONT);
+  }
+  /* Spec: do NOT wait for these processes to terminate. */
+}
+
+void register_bg_job(pid_t pid, const char *name, const char *cmdline) {
   pid_t pids[1] = { pid };
   char  names[1][BG_NAME_MAX];
 
@@ -82,7 +133,7 @@ void register_bg_job(pid_t pid, const char *name) {
   }
   /* A standalone command is a process group of one, and setpgid() made
      its pgid equal to its own pid. */
-  register_bg_group(pid, pids, names, 1);
+  register_bg_group(pid, pids, names, 1, cmdline);
 }
 
 int check_bg_jobs(void) {
@@ -157,6 +208,60 @@ const BgJob *bg_job_at(int idx) {
   return &bg_jobs[idx];
 }
 
+/* ── Lookup and mutation, for resume ──────────────────────────────── */
+
+static BgJob *find_mutable(int job_number) {
+  for (int i = 0; i < n_jobs; i++)
+    if (bg_jobs[i].job_number == job_number)
+      return &bg_jobs[i];
+  return NULL;
+}
+
+const BgJob *bg_find_job(int job_number) {
+  return find_mutable(job_number);
+}
+
+void bg_set_running(int job_number) {
+  BgJob *j = find_mutable(job_number);
+  if (j != NULL)
+    j->stopped = 0;
+}
+
+void bg_set_stopped(int job_number, const pid_t *pids, int n) {
+  BgJob *j = find_mutable(job_number);
+  if (j == NULL)
+    return;
+  if (n > MAX_JOB_PROCS)
+    n = MAX_JOB_PROCS;
+
+  /* Keep the stored name for each surviving pid; the rest have exited. */
+  BgProc kept[MAX_JOB_PROCS];
+  int kn = 0;
+  for (int i = 0; i < n; i++) {
+    for (int k = 0; k < j->nprocs; k++) {
+      if (j->procs[k].pid == pids[i]) {
+        kept[kn++] = j->procs[k];
+        break;
+      }
+    }
+  }
+  for (int i = 0; i < kn; i++)
+    j->procs[i] = kept[i];
+  j->nprocs  = kn;
+  j->stopped = 1;
+}
+
+void bg_remove_job(int job_number) {
+  for (int i = 0; i < n_jobs; i++) {
+    if (bg_jobs[i].job_number != job_number)
+      continue;
+    for (int m = i; m < n_jobs - 1; m++)   /* keep the array dense */
+      bg_jobs[m] = bg_jobs[m + 1];
+    n_jobs--;
+    return;
+  }
+}
+
 /* ── Extract argv up to TOKEN_OP_AMP (for background commands).       */
 /* Skips redirection operators (< > >>) and their targets. Caller      */
 /* must free().                                                        */
@@ -223,9 +328,11 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
     pid_t pids[MAX_JOB_PROCS];
     char  names[MAX_JOB_PROCS][BG_NAME_MAX];
     int   n = 0;
+    char cmdline[BG_CMD_MAX];
+    token_group_to_string(start, cmdline, sizeof(cmdline));
     pid_t pgid = execute_pipeline_bg(start, pids, names, MAX_JOB_PROCS, &n);
     if (pgid > 0 && n > 0)
-      register_bg_group(pgid, pids, names, n);
+      register_bg_group(pgid, pids, names, n, cmdline);
     return 0;
   }
 
@@ -244,7 +351,8 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
                     strcmp(argv[0], "reveal") == 0 ||
                     strcmp(argv[0], "locate") == 0 ||
                     strcmp(argv[0], "hop") == 0 ||
-                    strcmp(argv[0], "activities") == 0);
+                    strcmp(argv[0], "activities") == 0 ||
+                    strcmp(argv[0], "resume") == 0);
 
   char *resolved = NULL;
   if (!is_builtin) {
@@ -291,6 +399,8 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
         locate(argc, argv);
       } else if (strcmp(argv[0], "activities") == 0) {
         activities(argc, argv);
+      } else if (strcmp(argv[0], "resume") == 0) {
+        resume(argc, argv);
       } else if (strcmp(argv[0], "hop") == 0) {
         /* Load a fresh copy of the db; the child's chdir does not
            affect the parent shell's working directory anyway.      */
@@ -312,7 +422,9 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
      wins, so the job is never briefly in the shell's group. */
   setpgid(pid, pid);
 
-  register_bg_job(pid, argv[0]);
+  char cmdline[BG_CMD_MAX];
+  token_group_to_string(start, cmdline, sizeof(cmdline));
+  register_bg_job(pid, argv[0], cmdline);
   free(resolved);
   free(argv);
   return 0;

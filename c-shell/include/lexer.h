@@ -96,4 +96,18 @@ void print_tokens(const TokenList *token_list);
  */
 int validate_grammar(const TokenList *token_list);
 
+/**
+ * Rebuild the printable command line for ONE command group.
+ *
+ * Walks from `start` up to (not including) the next ';' or '&' and joins
+ * the words and operators with single spaces, so "sleep 100 | cat" comes
+ * back as written.  Used to label jobs, which must be shown to the user
+ * as a command line rather than a bare command name.
+ *
+ * @param start: first token of the group
+ * @param out:   destination buffer (always NUL-terminated)
+ * @param size:  size of out; the text is truncated to fit
+ */
+void token_group_to_string(Token *start, char *out, size_t size);
+
 #endif // LEXER_H
