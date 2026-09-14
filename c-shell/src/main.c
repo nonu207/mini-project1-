@@ -103,6 +103,8 @@ int main(void) {
 
   init_prompt();
   init_bg();
+  /* Remember our own pid before any fork, for a bare "spy". */
+  spy_init();
   /* Claim the terminal and make SIGTTOU harmless before any job runs. */
   term_init();
 

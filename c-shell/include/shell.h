@@ -14,6 +14,7 @@
 #include "activities.h"
 #include "resume.h"
 #include "ping.h"
+#include "spy.h"
 #include "term.h"
 
 /* ── Standard library headers ─────────────────────────────────────── */

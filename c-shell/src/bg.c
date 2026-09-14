@@ -353,6 +353,7 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
                     strcmp(argv[0], "hop") == 0 ||
                     strcmp(argv[0], "activities") == 0 ||
                     strcmp(argv[0], "ping") == 0 ||
+                    strcmp(argv[0], "spy") == 0 ||
                     strcmp(argv[0], "resume") == 0);
 
   char *resolved = NULL;
@@ -390,6 +391,11 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
     SavedFds saved;
     if (apply_redirections(start, &saved) < 0)
       _exit(1);
+    /* The child never restores its stdin/stdout, so drop the backup
+       copies; otherwise every background program inherits them as
+       stray descriptors 3 and 4. */
+    close(saved.saved_stdin);
+    close(saved.saved_stdout);
 
     if (is_builtin) {
       if (strcmp(argv[0], "peek") == 0) {
@@ -404,6 +410,8 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
         resume(argc, argv);
       } else if (strcmp(argv[0], "ping") == 0) {
         ping(argc, argv);
+      } else if (strcmp(argv[0], "spy") == 0) {
+        spy(argc, argv);
       } else if (strcmp(argv[0], "hop") == 0) {
         /* Load a fresh copy of the db; the child's chdir does not
            affect the parent shell's working directory anyway.      */
