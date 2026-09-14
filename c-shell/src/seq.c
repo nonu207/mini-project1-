@@ -205,6 +205,21 @@ static int run_group(Token *start, HopEntry *db, int *db_size) {
   }
 
   if (!has_pipe && start->type == TOKEN_WORD &&
+      strcmp(start->value, "snoop") == 0) {
+    int argc = 0;
+    char **argv = extract_group(start, &argc);
+    if (argv != NULL) {
+      SavedFds saved;
+      if (apply_redirections(start, &saved) == 0) {
+        snoop(argc, argv);
+        undo_redirections(&saved);
+      }
+      free(argv);
+    }
+    return 0;
+  }
+
+  if (!has_pipe && start->type == TOKEN_WORD &&
       strcmp(start->value, "spy") == 0) {
     int argc = 0;
     char **argv = extract_group(start, &argc);

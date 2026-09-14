@@ -56,6 +56,12 @@ void register_bg_job(pid_t pid, const char *name, const char *cmdline);
    whose processes have all exited.  Returns how many messages printed. */
 int  check_bg_jobs(void);
 
+/* Record that `pid` exited with wait status `status`, for a child that was
+   reaped somewhere other than check_bg_jobs (snoop -p collects the exit of
+   the job it traces).  Announces and retires the job if it was the last
+   process.  Unknown pids are ignored.  Returns 1 if a message printed. */
+int  bg_child_exited(pid_t pid, int status);
+
 int  run_bg_group(Token *start, HopEntry *db, int *db_size);
 
 /* Register a foreground job that Ctrl-Z just suspended.  Assigns the next

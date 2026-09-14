@@ -20,7 +20,8 @@ C-Shell is a custom, lightweight shell written in C that parses and executes use
 6. **`resume`:** Continues a stopped job in the foreground or background.
 7. **`ping <target> <signal>`:** Sends `signal % 64` to a tracked pid, or to every process in a job with `%job`.
 8. **`spy [pid]`:** Lists a process's open files (cwd, txt, mem, numeric fds) from `/proc`. Linux only.
-9. **Execution:** Can execute external system commands seamlessly.
+9. **`snoop command [args...]` / `snoop -p pid`:** Traces a process's system calls with `ptrace` and, when it exits, prints each syscall's call count and total time. With `-p`, Ctrl-C detaches and prints the summary so far. Linux only.
+10. **Execution:** Can execute external system commands seamlessly.
 
 ## Running the Shell (Linux, recommended)
 
@@ -41,7 +42,7 @@ From the `c-shell` folder:
 cd c-shell
 ./linux.sh           # compile in Linux, then open the shell (Ctrl-D to exit)
 ./linux.sh build     # only compile: exact assignment flags, plus an extra -O2 warning pass
-./linux.sh test      # compile, then run tests/test_ping.sh and tests/test_spy.sh
+./linux.sh test      # compile, then run the ping, spy and snoop test suites
 ./linux.sh bash      # a Linux bash prompt in /build with shell.out already compiled
 ```
 
@@ -50,8 +51,9 @@ just run `./linux.sh` again. Your source is mounted read-only and copied into
 the container: nothing on your machine is modified.
 
 The first run builds a small image called `cshell-linux` from `c-shell/Dockerfile`
-(GCC 14, the first release that accepts `-std=c23`, plus `lsof`, `ps` and
-`script` for the tests). Later runs reuse it.
+(GCC 14, the first release that accepts `-std=c23`, plus `lsof`, `strace`, `ps`
+and `script` for the tests). Later runs reuse it, and it is rebuilt
+automatically if the `Dockerfile` changes.
 
 ### Before submitting
 
@@ -79,13 +81,15 @@ make clean all
 ./shell.out
 ```
 
-On macOS `spy` prints `spy: /proc is not available on this system`, and signal
+On macOS `spy` prints `spy: /proc is not available on this system`, `snoop`
+prints `snoop: not supported on this system`, and signal
 numbers differ from Linux (stop is 17 and continue is 19 on macOS; 19 and 18 on
 Linux; see `kill -l`).
 
 ## Structure
 
-* `c-shell/src/` - Source code (`main.c`, `lexer.c`, `exec.c`, `ping.c`, `spy.c`, etc.)
-* `c-shell/include/` - Header files (`lexer.h`, `prompt.h`, `ping.h`, `spy.h`, etc.)
-* `c-shell/tests/` - Test scripts for `ping` and `spy`, run by `./linux.sh test`
+* `c-shell/src/` - Source code (`main.c`, `lexer.c`, `exec.c`, `ping.c`, `spy.c`, `snoop.c`, etc.)
+* `c-shell/include/` - Header files (`lexer.h`, `prompt.h`, `ping.h`, `spy.h`, `snoop.h`, etc.)
+  * `syscall_table.h` - Syscall number → name table for `snoop`, taking numbers from the kernel headers of whichever architecture compiles it
+* `c-shell/tests/` - Test scripts for `ping`, `spy` and `snoop` (plus `snoop_target.c`, a program with a known syscall profile), run by `./linux.sh test`
 * `c-shell/Dockerfile`, `c-shell/linux.sh` - The Linux build and run environment

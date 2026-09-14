@@ -649,6 +649,7 @@ int execute_pipeline(Token *start) {
                       strcmp(argv[0], "activities") == 0 ||
                       strcmp(argv[0], "ping") == 0 ||
                       strcmp(argv[0], "spy") == 0 ||
+                      strcmp(argv[0], "snoop") == 0 ||
                     strcmp(argv[0], "resume") == 0);
 
     char *resolved = NULL;
@@ -711,6 +712,8 @@ int execute_pipeline(Token *start) {
           ping(argc, argv);
         } else if (strcmp(argv[0], "spy") == 0) {
           spy(argc, argv);
+        } else if (strcmp(argv[0], "snoop") == 0) {
+          snoop(argc, argv);
         } else if (strcmp(argv[0], "hop") == 0) {
           HopEntry db[MAX_HOP_ENTRIES];
           int db_size = 0;
@@ -902,6 +905,7 @@ pid_t execute_pipeline_bg(Token *start, pid_t *out_pids,
                       strcmp(argv[0], "activities") == 0 ||
                       strcmp(argv[0], "ping") == 0 ||
                       strcmp(argv[0], "spy") == 0 ||
+                      strcmp(argv[0], "snoop") == 0 ||
                     strcmp(argv[0], "resume") == 0);
 
     char *resolved = NULL;
@@ -975,6 +979,8 @@ pid_t execute_pipeline_bg(Token *start, pid_t *out_pids,
           ping(argc, argv);
         } else if (strcmp(argv[0], "spy") == 0) {
           spy(argc, argv);
+        } else if (strcmp(argv[0], "snoop") == 0) {
+          snoop(argc, argv);
         } else if (strcmp(argv[0], "hop") == 0) {
           HopEntry db[MAX_HOP_ENTRIES];
           int db_size = 0;

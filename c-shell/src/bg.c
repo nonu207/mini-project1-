@@ -136,63 +136,67 @@ void register_bg_job(pid_t pid, const char *name, const char *cmdline) {
   register_bg_group(pid, pids, names, 1, cmdline);
 }
 
+int bg_child_exited(pid_t pid, int status) {
+  for (int i = 0; i < n_jobs; i++) {
+    BgJob *j = &bg_jobs[i];
+
+    int found = -1;
+    for (int k = 0; k < j->nprocs; k++) {
+      if (j->procs[k].pid == pid) {
+        found = k;
+        break;
+      }
+    }
+    if (found < 0)
+      continue;
+
+    /* Remember the lead's verdict: it identifies the whole job, and it
+       may exit long before the last stage does. */
+    if (pid == j->lead_pid) {
+      j->lead_status = status;
+      j->lead_reaped = 1;
+    }
+    j->last_status = status;
+
+    /* Drop just this process, keeping the rest in pipeline order. */
+    for (int k = found; k < j->nprocs - 1; k++)
+      j->procs[k] = j->procs[k + 1];
+    j->nprocs--;
+
+    /* The job retires only once every process is gone. */
+    if (j->nprocs == 0) {
+      int st = j->lead_reaped ? j->lead_status : j->last_status;
+      /* Spec: print to stdout (same stream as the prompt and [N] pid).
+         Format: "<name> with pid <pid> exited normally"   (WIFEXITED)
+                 "<name> with pid <pid> exited abnormally" (WIFSIGNALED)
+         Note: NO trailing period — the spec examples have none.
+         The name and pid are the lead's, so one line per job. */
+      if (WIFEXITED(st)) {
+        printf("%s with pid %d exited normally\n",
+               j->lead_name, (int)j->lead_pid);
+      } else if (WIFSIGNALED(st)) {
+        printf("%s with pid %d exited abnormally\n",
+               j->lead_name, (int)j->lead_pid);
+      }
+      fflush(stdout);
+
+      for (int m = i; m < n_jobs - 1; m++)  /* keep the array dense */
+        bg_jobs[m] = bg_jobs[m + 1];
+      n_jobs--;
+      return 1;
+    }
+    return 0;  /* pids are unique across jobs */
+  }
+  return 0;
+}
+
 int check_bg_jobs(void) {
   int status;
   pid_t pid;
   int reported = 0;
 
-  while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-    for (int i = 0; i < n_jobs; i++) {
-      BgJob *j = &bg_jobs[i];
-
-      int found = -1;
-      for (int k = 0; k < j->nprocs; k++) {
-        if (j->procs[k].pid == pid) {
-          found = k;
-          break;
-        }
-      }
-      if (found < 0)
-        continue;
-
-      /* Remember the lead's verdict: it identifies the whole job, and it
-         may exit long before the last stage does. */
-      if (pid == j->lead_pid) {
-        j->lead_status = status;
-        j->lead_reaped = 1;
-      }
-      j->last_status = status;
-
-      /* Drop just this process, keeping the rest in pipeline order. */
-      for (int k = found; k < j->nprocs - 1; k++)
-        j->procs[k] = j->procs[k + 1];
-      j->nprocs--;
-
-      /* The job retires only once every process is gone. */
-      if (j->nprocs == 0) {
-        int st = j->lead_reaped ? j->lead_status : j->last_status;
-        /* Spec: print to stdout (same stream as the prompt and [N] pid).
-           Format: "<name> with pid <pid> exited normally"   (WIFEXITED)
-                   "<name> with pid <pid> exited abnormally" (WIFSIGNALED)
-           Note: NO trailing period — the spec examples have none.
-           The name and pid are the lead's, so one line per job. */
-        if (WIFEXITED(st)) {
-          printf("%s with pid %d exited normally\n",
-                 j->lead_name, (int)j->lead_pid);
-        } else if (WIFSIGNALED(st)) {
-          printf("%s with pid %d exited abnormally\n",
-                 j->lead_name, (int)j->lead_pid);
-        }
-        fflush(stdout);
-        reported++;
-
-        for (int m = i; m < n_jobs - 1; m++)  /* keep the array dense */
-          bg_jobs[m] = bg_jobs[m + 1];
-        n_jobs--;
-      }
-      break;  /* pids are unique across jobs */
-    }
-  }
+  while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+    reported += bg_child_exited(pid, status);
   return reported;
 }
 
@@ -354,6 +358,7 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
                     strcmp(argv[0], "activities") == 0 ||
                     strcmp(argv[0], "ping") == 0 ||
                     strcmp(argv[0], "spy") == 0 ||
+                    strcmp(argv[0], "snoop") == 0 ||
                     strcmp(argv[0], "resume") == 0);
 
   char *resolved = NULL;
@@ -412,6 +417,8 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
         ping(argc, argv);
       } else if (strcmp(argv[0], "spy") == 0) {
         spy(argc, argv);
+      } else if (strcmp(argv[0], "snoop") == 0) {
+        snoop(argc, argv);
       } else if (strcmp(argv[0], "hop") == 0) {
         /* Load a fresh copy of the db; the child's chdir does not
            affect the parent shell's working directory anyway.      */

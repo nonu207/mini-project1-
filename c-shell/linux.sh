@@ -18,10 +18,12 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
+# Cheap when nothing changed (every layer is cached), and picks up any
+# edit to the Dockerfile without having to remove the old image first.
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "Building the $IMAGE image (first run only)..."
-  docker build -t "$IMAGE" "$DIR"
 fi
+docker build -q -t "$IMAGE" "$DIR" >/dev/null
 
 FLAGS='-std=c23 -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -Wall -Wextra -Werror -Wno-unused-parameter -fno-asm'
 BUILD="cp -r /src/. /build && rm -f shell.out && gcc $FLAGS -Iinclude src/*.c -o shell.out"
@@ -36,7 +38,10 @@ run() {
 case "${1:-shell}" in
   shell) run "$BUILD && exec ./shell.out" ;;
   build) run "$BUILD && echo 'exact flags: OK' && gcc -O2 $FLAGS -Iinclude src/*.c -o /tmp/o2.out && echo '-O2: OK'" ;;
-  test)  run "$BUILD && echo '== ping ==' && bash tests/test_ping.sh /build/shell.out | grep -E '^(PASS|FAIL|passed)' && echo '== spy ==' && bash tests/test_spy.sh /build/shell.out | grep -E '^(PASS|FAIL|passed)'" ;;
+  test)  run "$BUILD && gcc tests/snoop_target.c -o /tmp/snoop_target \
+             && echo '== ping ==' && bash tests/test_ping.sh /build/shell.out | grep -E '^(PASS|FAIL|passed)' \
+             && echo '== spy ==' && bash tests/test_spy.sh /build/shell.out | grep -E '^(PASS|FAIL|passed)' \
+             && echo '== snoop ==' && bash tests/test_snoop.sh /build/shell.out /tmp/snoop_target | grep -E '^(PASS|FAIL|passed)'" ;;
   bash)  run "$BUILD && exec bash" ;;
   *)     echo "usage: $0 [shell|build|test|bash]" >&2; exit 2 ;;
 esac

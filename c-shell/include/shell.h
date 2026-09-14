@@ -15,6 +15,7 @@
 #include "resume.h"
 #include "ping.h"
 #include "spy.h"
+#include "snoop.h"
 #include "term.h"
 
 /* ── Standard library headers ─────────────────────────────────────── */
