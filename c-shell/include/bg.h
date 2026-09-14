@@ -62,6 +62,14 @@ int  check_bg_jobs(void);
    process.  Unknown pids are ignored.  Returns 1 if a message printed. */
 int  bg_child_exited(pid_t pid, int status);
 
+/* The SIGCHLD handler reaps (waitpid, WNOHANG) only "watched" pids: the
+   processes of tracked jobs.  Jobs are watched when registered.  Code that
+   waits on a job's process itself (resume fg, snoop -p) must unwatch it
+   first, or the handler could reap it out from under that wait.
+   bg_unwatch_pid returns 1 if the pid was being watched. */
+void bg_watch_pid(pid_t pid);
+int  bg_unwatch_pid(pid_t pid);
+
 int  run_bg_group(Token *start, HopEntry *db, int *db_size);
 
 /* Register a foreground job that Ctrl-Z just suspended.  Assigns the next
@@ -84,8 +92,8 @@ void bg_hangup_all(void);
 
    The returned pointer is valid only until the next register_bg_*() or
    check_bg_jobs() call.  That is safe because the table is mutated only
-   from main context -- the SIGCHLD handler is a deliberate no-op that
-   touches no shared state.  A future handler that writes to the table
+   from main context -- the SIGCHLD handler reaps into its own queue and
+   never touches the table.  A future handler that writes to the table
    would break this contract. */
 int          bg_live_count(void);
 const BgJob *bg_job_at(int idx);

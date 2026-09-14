@@ -318,7 +318,14 @@ static void snoop_pid(const char *arg) {
   }
   pid_t pid = (pid_t)value;
 
+  /* A tracer collects every stop and the exit of its tracee, so if this
+     is one of our background jobs the SIGCHLD handler must not reap it
+     while we trace.  Re-watched below if it is still alive. */
+  int was_watched = bg_unwatch_pid(pid);
+
   if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) < 0) {
+    if (was_watched)
+      bg_watch_pid(pid);
     if (errno == ESRCH)
       fprintf(stderr, "snoop: no such process\n");
     else if (errno == EPERM)
@@ -365,6 +372,8 @@ static void snoop_pid(const char *arg) {
      hand the status over or the job would stay listed forever. */
   if (result == TRACE_EXITED)
     bg_child_exited(pid, status);
+  else if (was_watched)
+    bg_watch_pid(pid);            /* detached and still running */
 }
 
 void snoop(int argc, char **argv) {

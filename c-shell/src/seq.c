@@ -42,59 +42,22 @@ static char **extract_group(Token *start, int *out_argc) {
 
 /* ------------------------------------------------------------------ */
 /* Redirection helpers for built-in commands.                          */
-/* Applies < > >> from the token list to the shell's own fds.          */
+/* Applies < > >> from the token list to the shell's own fds, using    */
+/* the same feeder/tee helpers as external commands (see exec.c), so   */
+/* several < files form one stream and every > / >> file gets output.  */
 /* Returns 0 on success, -1 on error (caller must not run builtin).    */
 /* Caller must call undo_redirections() afterwards.                    */
 /* ------------------------------------------------------------------ */
 int apply_redirections(Token *start, SavedFds *saved) {
+  if (!redirs_validate(start, NULL))
+    return -1;
+  if (redirs_open(start, NULL, &saved->redirs) != 0)
+    return -1;
+
+  fflush(stdout);  /* earlier output must not end up in the files */
   saved->saved_stdin  = dup(STDIN_FILENO);
   saved->saved_stdout = dup(STDOUT_FILENO);
-  int error = 0;
-
-  Token *t = start;
-  while (t != NULL) {
-    if (t->type == TOKEN_OP_SEMI || t->type == TOKEN_OP_AMP)
-      break;
-
-    if (t->type == TOKEN_OP_LT) {
-      t = t->next;
-      if (t == NULL || t->type != TOKEN_WORD) { error = 1; break; }
-      int fd = open(t->value, O_RDONLY);
-      if (fd < 0) {
-        fprintf(stderr, "cshell: no such file or directory\n");
-        error = 1;
-        break;
-      }
-      dup2(fd, STDIN_FILENO);
-      close(fd);
-    } else if (t->type == TOKEN_OP_GT || t->type == TOKEN_OP_GTGT) {
-      Token *op = t;
-      t = t->next;
-      if (t == NULL || t->type != TOKEN_WORD) { error = 1; break; }
-      int flags = O_WRONLY | O_CREAT;
-      if (op->type == TOKEN_OP_GTGT)
-        flags |= O_APPEND;
-      else
-        flags |= O_TRUNC;
-      int fd = open(t->value, flags, 0644);
-      if (fd < 0) {
-        fprintf(stderr, "cshell: unable to create file for writing\n");
-        error = 1;
-        break;
-      }
-      dup2(fd, STDOUT_FILENO);
-      close(fd);
-    }
-    t = t->next;
-  }
-
-  if (error) {
-    dup2(saved->saved_stdin, STDIN_FILENO);
-    dup2(saved->saved_stdout, STDOUT_FILENO);
-    close(saved->saved_stdin);
-    close(saved->saved_stdout);
-    return -1;
-  }
+  redirs_install(&saved->redirs);
   return 0;
 }
 
@@ -104,6 +67,9 @@ void undo_redirections(const SavedFds *saved) {
   close(saved->saved_stdout);
   dup2(saved->saved_stdin, STDIN_FILENO);
   close(saved->saved_stdin);
+  /* Restoring dropped the shell's pipe ends: a tee now sees EOF, and a
+     feeder whose data the built-in never read gets SIGPIPE.  Both exit. */
+  redirs_wait(&saved->redirs);
 }
 
 /* ------------------------------------------------------------------ */

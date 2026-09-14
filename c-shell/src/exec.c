@@ -11,6 +11,10 @@ static void child_default_signals(void) {
   signal(SIGTSTP, SIG_DFL);
   signal(SIGTTOU, SIG_DFL);
   signal(SIGTTIN, SIG_DFL);
+  /* The shell ignores SIGPIPE while wiring a pipeline, and an ignored
+     signal survives execve.  Restore it, or a stage whose reader has gone
+     ("yes | head -1") prints "Broken pipe" instead of exiting quietly. */
+  signal(SIGPIPE, SIG_DFL);
 }
 
 /* ------------------------------------------------------------------ */
@@ -131,31 +135,59 @@ char *resolve_command(const char *name) {
   return NULL;
 }
 
-/* ------------------------------------------------------------------ */
-/* Helper: check if token list (from start up to ; or &) has an op.   */
-/* ------------------------------------------------------------------ */
-static int has_operator(Token *start, TokenType op) {
-  for (Token *t = start; t != NULL; t = t->next) {
-    if (t->type == TOKEN_OP_SEMI || t->type == TOKEN_OP_AMP)
-      break;
-    if (t->type == op)
-      return 1;
+/* ================================================================== */
+/* Redirection support                                                 */
+/*                                                                      */
+/* One < or > is a file opened in the shell and dup2'd onto the        */
+/* command's stdin/stdout.  Several < files are joined into one stream */
+/* by a small feeder process writing them, in order, into a pipe;      */
+/* several > / >> files are filled by a small tee process copying a    */
+/* pipe into each of them.  The helpers run alongside the command, so  */
+/* the shell never pumps data itself and cannot deadlock, and output   */
+/* reaches the files as it is produced.                                */
+/* ================================================================== */
+
+/* is_redir_end: does t end the scan of a command's tokens [start, end)? */
+static int is_redir_end(Token *t, Token *end) {
+  return t == NULL || t == end ||
+         t->type == TOKEN_OP_SEMI || t->type == TOKEN_OP_AMP;
+}
+
+/* output_flags: open() flags for a > (truncate) or >> (append) target. */
+static int output_flags(TokenType op) {
+  return O_WRONLY | O_CREAT | (op == TOKEN_OP_GTGT ? O_APPEND : O_TRUNC);
+}
+
+/* close_fds_from: close every descriptor >= low.  A helper must hold  */
+/* no pipe end but its own, or a reader elsewhere would never see EOF. */
+static void close_fds_from(int low) {
+  long max = sysconf(_SC_OPEN_MAX);
+  if (max < 0 || max > 4096)
+    max = 4096;
+  for (int fd = low; fd < max; fd++)
+    close(fd);
+}
+
+/* write_all: write the whole buffer, retrying short writes. */
+static int write_all(int fd, const char *buf, size_t len) {
+  while (len > 0) {
+    ssize_t w = write(fd, buf, len);
+    if (w < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    buf += w;
+    len -= (size_t)w;
   }
   return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* validate_input_redirections: check that all < target files exist.  */
-/* Returns 1 if all OK, 0 if any file is missing.                     */
-/* ------------------------------------------------------------------ */
-static int validate_input_redirections(Token *start) {
-  Token *t = start;
-  while (t != NULL) {
-    if (t->type == TOKEN_OP_SEMI || t->type == TOKEN_OP_AMP)
-      break;
+int redirs_validate(Token *start, Token *end) {
+  for (Token *t = start; !is_redir_end(t, end); t = t->next) {
     if (t->type == TOKEN_OP_LT) {
       t = t->next;
-      if (t == NULL || t->type != TOKEN_WORD)
+      if (is_redir_end(t, end) || t->type != TOKEN_WORD)
         return 0;
       int fd = open(t->value, O_RDONLY);
       if (fd < 0) {
@@ -163,95 +195,226 @@ static int validate_input_redirections(Token *start) {
         return 0;
       }
       close(fd);
-    }
-    t = t->next;
-  }
-  return 1;
-}
-
-/* ------------------------------------------------------------------ */
-/* validate_output_redirections: check all > / >> files are writable. */
-/* Returns 1 if all OK, 0 if any file cannot be opened.               */
-/* ------------------------------------------------------------------ */
-static int validate_output_redirections(Token *start) {
-  Token *t = start;
-  while (t != NULL) {
-    if (t->type == TOKEN_OP_SEMI || t->type == TOKEN_OP_AMP)
-      break;
-    if (t->type == TOKEN_OP_GT || t->type == TOKEN_OP_GTGT) {
-      Token *op = t;
+    } else if (t->type == TOKEN_OP_GT || t->type == TOKEN_OP_GTGT) {
+      TokenType op = t->type;
       t = t->next;
-      if (t == NULL || t->type != TOKEN_WORD)
+      if (is_redir_end(t, end) || t->type != TOKEN_WORD)
         return 0;
-      int flags = O_WRONLY | O_CREAT;
-      if (op->type == TOKEN_OP_GTGT)
-        flags |= O_APPEND;
-      else
-        flags |= O_TRUNC;
-      int fd = open(t->value, flags, 0644);
+      int fd = open(t->value, output_flags(op), 0644);
       if (fd < 0) {
         fprintf(stderr, "cshell: unable to create file for writing\n");
         return 0;
       }
       close(fd);
     }
-    t = t->next;
   }
   return 1;
 }
 
 /* ------------------------------------------------------------------ */
-/* feed_input_files: write all < file contents into pipe write-end.   */
+/* spawn_feeder: fork a process that writes every < file of            */
+/* [start, end), in order, into a pipe.  Returns the pipe's read end   */
+/* (to become the command's stdin) and sets *pid_out, or returns -1.   */
 /* ------------------------------------------------------------------ */
-static void feed_input_files(Token *start, int pipe_wr) {
-  Token *t = start;
-  while (t != NULL) {
-    if (t->type == TOKEN_OP_SEMI || t->type == TOKEN_OP_AMP)
-      break;
-    if (t->type == TOKEN_OP_LT) {
+static int spawn_feeder(Token *start, Token *end, pid_t *pid_out) {
+  int p[2];
+  if (pipe(p) < 0) {
+    perror("pipe");
+    return -1;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    perror("fork");
+    close(p[0]);
+    close(p[1]);
+    return -1;
+  }
+
+  if (pid == 0) {
+    signal(SIGPIPE, SIG_DFL);   /* command stopped reading: just stop */
+    dup2(p[1], STDOUT_FILENO);
+    close_fds_from(3);
+
+    char buf[4096];
+    for (Token *t = start; !is_redir_end(t, end); t = t->next) {
+      if (t->type != TOKEN_OP_LT)
+        continue;
       t = t->next;
-      if (t == NULL || t->type != TOKEN_WORD)
+      if (is_redir_end(t, end))
         break;
       int fd = open(t->value, O_RDONLY);
       if (fd < 0)
-        break;
-      char buf[4096];
+        continue;
       ssize_t n;
-      while ((n = read(fd, buf, sizeof(buf))) > 0)
-        write(pipe_wr, buf, (size_t)n);
+      while ((n = read(fd, buf, sizeof(buf))) != 0) {
+        if (n < 0) {
+          if (errno == EINTR)
+            continue;
+          break;
+        }
+        if (write_all(STDOUT_FILENO, buf, (size_t)n) < 0)
+          _exit(1);
+      }
       close(fd);
     }
-    t = t->next;
+    _exit(0);
   }
+
+  close(p[1]);
+  *pid_out = pid;
+  return p[0];
 }
 
 /* ------------------------------------------------------------------ */
-/* write_output_files: write captured output to all > / >> targets.   */
+/* spawn_tee: fork a process that copies a pipe into every > / >> file */
+/* of [start, end), each opened with its own mode.  Returns the pipe's */
+/* write end (to become the command's stdout) and sets *pid_out, or    */
+/* returns -1.                                                          */
 /* ------------------------------------------------------------------ */
-static void write_output_files(Token *start,
-                               const char *data, size_t len) {
-  Token *t = start;
-  while (t != NULL) {
-    if (t->type == TOKEN_OP_SEMI || t->type == TOKEN_OP_AMP)
-      break;
-    if (t->type == TOKEN_OP_GT || t->type == TOKEN_OP_GTGT) {
-      Token *op = t;
+static int spawn_tee(Token *start, Token *end, int n_out, pid_t *pid_out) {
+  int p[2];
+  if (pipe(p) < 0) {
+    perror("pipe");
+    return -1;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    perror("fork");
+    close(p[0]);
+    close(p[1]);
+    return -1;
+  }
+
+  if (pid == 0) {
+    signal(SIGPIPE, SIG_DFL);
+    dup2(p[0], STDIN_FILENO);
+    close_fds_from(3);
+
+    int *fds = malloc((size_t)n_out * sizeof(int));
+    if (fds == NULL)
+      _exit(1);
+    int k = 0;
+    for (Token *t = start; !is_redir_end(t, end) && k < n_out; t = t->next) {
+      if (t->type != TOKEN_OP_GT && t->type != TOKEN_OP_GTGT)
+        continue;
+      TokenType op = t->type;
       t = t->next;
-      if (t == NULL || t->type != TOKEN_WORD)
+      if (is_redir_end(t, end))
         break;
-      int flags = O_WRONLY | O_CREAT;
-      if (op->type == TOKEN_OP_GTGT)
-        flags |= O_APPEND;
-      else
-        flags |= O_TRUNC;
-      int fd = open(t->value, flags, 0644);
-      if (fd >= 0) {
-        if (len > 0)
-          write(fd, data, len);
-        close(fd);
+      fds[k++] = open(t->value, output_flags(op), 0644);
+    }
+
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(STDIN_FILENO, buf, sizeof(buf))) != 0) {
+      if (n < 0) {
+        if (errno == EINTR)
+          continue;
+        break;
+      }
+      /* A file that fails a write is dropped; the others keep going. */
+      for (int i = 0; i < k; i++) {
+        if (fds[i] >= 0 && write_all(fds[i], buf, (size_t)n) < 0) {
+          close(fds[i]);
+          fds[i] = -1;
+        }
       }
     }
-    t = t->next;
+    _exit(0);
+  }
+
+  close(p[0]);
+  *pid_out = pid;
+  return p[1];
+}
+
+int redirs_open(Token *start, Token *end, Redirs *r) {
+  r->in_fd = -1;
+  r->out_fd = -1;
+  r->helper[0] = 0;
+  r->helper[1] = 0;
+
+  /* Count the targets, remembering the last of each kind for the
+     single-file case. */
+  int n_in = 0, n_out = 0;
+  Token *last_in = NULL;   /* the < target word  */
+  Token *last_out = NULL;  /* the > or >> operator */
+  for (Token *t = start; !is_redir_end(t, end); t = t->next) {
+    if (t->type == TOKEN_OP_LT && t->next != NULL) {
+      n_in++;
+      last_in = t->next;
+      t = t->next;
+    } else if ((t->type == TOKEN_OP_GT || t->type == TOKEN_OP_GTGT) &&
+               t->next != NULL) {
+      n_out++;
+      last_out = t;
+      t = t->next;
+    }
+  }
+
+  if (n_in == 1) {
+    r->in_fd = open(last_in->value, O_RDONLY);
+    if (r->in_fd < 0) {
+      fprintf(stderr, "cshell: no such file or directory\n");
+      return -1;
+    }
+  } else if (n_in > 1) {
+    r->in_fd = spawn_feeder(start, end, &r->helper[0]);
+    if (r->in_fd < 0)
+      return -1;
+  }
+
+  if (n_out == 1) {
+    r->out_fd = open(last_out->next->value, output_flags(last_out->type),
+                     0644);
+    if (r->out_fd < 0)
+      fprintf(stderr, "cshell: unable to create file for writing\n");
+  } else if (n_out > 1) {
+    r->out_fd = spawn_tee(start, end, n_out, &r->helper[1]);
+  }
+
+  if (n_out > 0 && r->out_fd < 0) {
+    redirs_close(r);   /* feeder sees its reader gone and exits */
+    redirs_wait(r);
+    r->helper[0] = 0;
+    r->helper[1] = 0;
+    return -1;
+  }
+  return 0;
+}
+
+void redirs_install(Redirs *r) {
+  if (r->in_fd >= 0) {
+    dup2(r->in_fd, STDIN_FILENO);
+    close(r->in_fd);
+    r->in_fd = -1;
+  }
+  if (r->out_fd >= 0) {
+    dup2(r->out_fd, STDOUT_FILENO);
+    close(r->out_fd);
+    r->out_fd = -1;
+  }
+}
+
+void redirs_close(Redirs *r) {
+  if (r->in_fd >= 0) {
+    close(r->in_fd);
+    r->in_fd = -1;
+  }
+  if (r->out_fd >= 0) {
+    close(r->out_fd);
+    r->out_fd = -1;
+  }
+}
+
+void redirs_wait(const Redirs *r) {
+  for (int i = 0; i < 2; i++) {
+    if (r->helper[i] <= 0)
+      continue;
+    while (waitpid(r->helper[i], NULL, 0) < 0 && errno == EINTR)
+      ;
   }
 }
 
@@ -263,14 +426,8 @@ int execute_command(int argc, char **argv, Token *start) {
   if (argc < 1 || argv[0] == NULL)
     return 0;
 
-  int has_input  = has_operator(start, TOKEN_OP_LT);
-  int has_output = has_operator(start, TOKEN_OP_GT) ||
-                   has_operator(start, TOKEN_OP_GTGT);
-
   /* ── Validate redirections before forking ────────────────────────── */
-  if (has_input && !validate_input_redirections(start))
-    return 0;
-  if (has_output && !validate_output_redirections(start))
+  if (!redirs_validate(start, NULL))
     return 0;
 
   /* ── Resolve executable ──────────────────────────────────────────── */
@@ -281,49 +438,9 @@ int execute_command(int argc, char **argv, Token *start) {
     return 1;
   }
 
-  /* ── No redirections: simple fork + exec ─────────────────────────── */
-  if (!has_input && !has_output) {
-    pid_t pid = fork();
-    if (pid < 0) {
-      perror("fork");
-      free(resolved);
-      return 0;
-    }
-    if (pid == 0) {
-      setpgid(0, 0);              /* own group: ^C/^Z reach only this job */
-      child_default_signals();
-      execve(resolved, argv, environ);
-      perror("execve");
-      _exit(1);
-    }
-    setpgid(pid, pid);            /* race-free: both sides set it */
-    free(resolved);
-
-    pid_t pids[1] = { pid };
-    char  names[1][BG_NAME_MAX];
-    strncpy(names[0], argv[0], BG_NAME_MAX - 1);
-    names[0][BG_NAME_MAX - 1] = '\0';
-
-    char cmdline[BG_CMD_MAX];
-    token_group_to_string(start, cmdline, sizeof(cmdline));
-
-    term_give(pid);
-    fg_wait(pid, pids, names, 1, cmdline);
-    return 0;
-  }
-
-  /* ── Set up pipes ────────────────────────────────────────────────── */
-  int in_pipe[2]  = {-1, -1};
-  int out_pipe[2] = {-1, -1};
-
-  if (has_input && pipe(in_pipe) < 0) {
-    perror("pipe");
-    free(resolved);
-    return 0;
-  }
-  if (has_output && pipe(out_pipe) < 0) {
-    perror("pipe");
-    if (has_input) { close(in_pipe[0]); close(in_pipe[1]); }
+  /* ── Open redirections (plain fds, or feeder/tee helpers) ────────── */
+  Redirs redirs;
+  if (redirs_open(start, NULL, &redirs) != 0) {
     free(resolved);
     return 0;
   }
@@ -331,76 +448,36 @@ int execute_command(int argc, char **argv, Token *start) {
   pid_t pid = fork();
   if (pid < 0) {
     perror("fork");
-    if (has_input)  { close(in_pipe[0]);  close(in_pipe[1]);  }
-    if (has_output) { close(out_pipe[0]); close(out_pipe[1]); }
+    redirs_close(&redirs);
+    redirs_wait(&redirs);
     free(resolved);
     return 0;
   }
-
   if (pid == 0) {
-    /* ── Child ──────────────────────────────────────────────────────── */
-    setpgid(0, 0);
+    setpgid(0, 0);              /* own group: ^C/^Z reach only this job */
     child_default_signals();
-    if (has_input) {
-      close(in_pipe[1]);
-      dup2(in_pipe[0], STDIN_FILENO);
-      close(in_pipe[0]);
-    }
-    if (has_output) {
-      close(out_pipe[0]);
-      dup2(out_pipe[1], STDOUT_FILENO);
-      close(out_pipe[1]);
-    }
+    redirs_install(&redirs);
     execve(resolved, argv, environ);
     perror("execve");
     _exit(1);
   }
-
-  /* ── Parent ──────────────────────────────────────────────────────── */
-  setpgid(pid, pid);
-  term_give(pid);
+  setpgid(pid, pid);            /* race-free: both sides set it */
+  redirs_close(&redirs);        /* only the child holds them now */
   free(resolved);
 
-  /* Feed input files to child's stdin */
-  if (has_input) {
-    close(in_pipe[0]);
-    feed_input_files(start, in_pipe[1]);
-    close(in_pipe[1]);
-  }
+  pid_t pids[1] = { pid };
+  char  names[1][BG_NAME_MAX];
+  strncpy(names[0], argv[0], BG_NAME_MAX - 1);
+  names[0][BG_NAME_MAX - 1] = '\0';
 
-  /* Capture child's stdout and write to all output files */
-  if (has_output) {
-    close(out_pipe[1]);
-    size_t cap = 0;
-    size_t len = 0;
-    char *buf = NULL;
-    char chunk[4096];
-    ssize_t n;
-    while ((n = read(out_pipe[0], chunk, sizeof(chunk))) > 0) {
-      if (len + (size_t)n > cap) {
-        size_t new_cap = (cap == 0) ? 4096 : cap * 2;
-        while (new_cap < len + (size_t)n)
-          new_cap *= 2;
-        char *tmp = realloc(buf, new_cap);
-        if (tmp == NULL) { free(buf); close(out_pipe[0]); return 0; }
-        buf = tmp;
-        cap = new_cap;
-      }
-      memcpy(buf + len, chunk, (size_t)n);
-      len += (size_t)n;
-    }
-    close(out_pipe[0]);
-    write_output_files(start, buf, len);
-    free(buf);
-  }
+  char cmdline[BG_CMD_MAX];
+  token_group_to_string(start, cmdline, sizeof(cmdline));
 
-  pid_t fg_pids[1] = { pid };
-  char  fg_names[1][BG_NAME_MAX];
-  strncpy(fg_names[0], argv[0], BG_NAME_MAX - 1);
-  fg_names[0][BG_NAME_MAX - 1] = '\0';
-  char fg_cmdline[BG_CMD_MAX];
-  token_group_to_string(start, fg_cmdline, sizeof(fg_cmdline));
-  fg_wait(pid, fg_pids, fg_names, 1, fg_cmdline);
+  term_give(pid);
+  /* A stopped job still holds its pipe ends, so its helpers cannot
+     finish yet; check_bg_jobs reaps them later instead. */
+  if (!fg_wait(pid, pids, names, 1, cmdline))
+    redirs_wait(&redirs);
   return 0;
 }
 
@@ -456,85 +533,14 @@ static char **extract_segment_argv(Token *start, Token *end, int *out_argc) {
 }
 
 /* ------------------------------------------------------------------ */
-/* validate_segment_redirs: validate < and > files for one segment.   */
-/* Returns 1 if OK, 0 if any file fails.                              */
-/* ------------------------------------------------------------------ */
-static int validate_segment_redirs(Token *start, Token *end) {
-  for (Token *t = start; t != end; t = t->next) {
-    if (t->type == TOKEN_OP_LT) {
-      t = t->next;
-      if (t == end || t->type != TOKEN_WORD)
-        return 0;
-      int fd = open(t->value, O_RDONLY);
-      if (fd < 0) {
-        fprintf(stderr, "cshell: no such file or directory\n");
-        return 0;
-      }
-      close(fd);
-    } else if (t->type == TOKEN_OP_GT || t->type == TOKEN_OP_GTGT) {
-      Token *op = t;
-      t = t->next;
-      if (t == end || t->type != TOKEN_WORD)
-        return 0;
-      int flags = O_WRONLY | O_CREAT;
-      if (op->type == TOKEN_OP_GTGT)
-        flags |= O_APPEND;
-      else
-        flags |= O_TRUNC;
-      int fd = open(t->value, flags, 0644);
-      if (fd < 0) {
-        fprintf(stderr, "cshell: unable to create file for writing\n");
-        return 0;
-      }
-      close(fd);
-    }
-  }
-  return 1;
-}
-
-/* ------------------------------------------------------------------ */
-/* apply_segment_redirs: in child process, set up < and > for one     */
-/* segment. Returns 0 on success, -1 on error (child should exit).    */
-/* ------------------------------------------------------------------ */
-static int apply_segment_redirs(Token *start, Token *end) {
-  for (Token *t = start; t != end; t = t->next) {
-    if (t->type == TOKEN_OP_LT) {
-      t = t->next;
-      if (t == end || t->type != TOKEN_WORD)
-        return -1;
-      int fd = open(t->value, O_RDONLY);
-      if (fd < 0)
-        return -1;
-      dup2(fd, STDIN_FILENO);
-      close(fd);
-    } else if (t->type == TOKEN_OP_GT || t->type == TOKEN_OP_GTGT) {
-      Token *op = t;
-      t = t->next;
-      if (t == end || t->type != TOKEN_WORD)
-        return -1;
-      int flags = O_WRONLY | O_CREAT;
-      if (op->type == TOKEN_OP_GTGT)
-        flags |= O_APPEND;
-      else
-        flags |= O_TRUNC;
-      int fd = open(t->value, flags, 0644);
-      if (fd < 0)
-        return -1;
-      dup2(fd, STDOUT_FILENO);
-      close(fd);
-    }
-  }
-  return 0;
-}
-
-/* ------------------------------------------------------------------ */
 /* execute_pipeline: execute a chain of commands connected by pipes.   */
 /* Tokens are scanned from start up to the first ; or & or end.        */
-/* Returns 0 if every stage was found, 1 if any stage was not found.   */
+/* Always returns 0: spec C4 says a not-found stage "does not count as */
+/* a failed command" for D1, so it must not stop a ; sequence.  Each   */
+/* such stage already printed its own "command not found" error.       */
 /* ------------------------------------------------------------------ */
 int execute_pipeline(Token *start) {
   void (*old_handler)(int) = signal(SIGPIPE, SIG_IGN);
-  int all_found = 1;
 
   /* ── 1. Count segments (commands) separated by | ──────────────────── */
   int n_cmds = 1;
@@ -571,7 +577,7 @@ int execute_pipeline(Token *start) {
 
   /* ── 3. Validate redirections for each segment ────────────────────── */
   for (int i = 0; i < n_cmds; i++) {
-    if (!validate_segment_redirs(seg_starts[i], seg_ends[i])) {
+    if (!redirs_validate(seg_starts[i], seg_ends[i])) {
       free(seg_starts);
       free(seg_ends);
       return 0;
@@ -606,7 +612,9 @@ int execute_pipeline(Token *start) {
   /* ── 5. Fork children ────────────────────────────────────────────── */
   pid_t *pids = malloc(n_cmds * sizeof(pid_t));
   char (*names)[BG_NAME_MAX] = malloc(n_cmds * BG_NAME_MAX);
-  if (pids == NULL || names == NULL) {
+  /* Per-stage redirections; zeroed so unused entries have no helpers. */
+  Redirs *redirs = calloc(n_cmds, sizeof(Redirs));
+  if (pids == NULL || names == NULL || redirs == NULL) {
     if (pipefds) {
       for (int i = 0; i < n_pipes; i++) {
         close(pipefds[i][0]);
@@ -616,6 +624,7 @@ int execute_pipeline(Token *start) {
     }
     free(pids);
     free(names);
+    free(redirs);
     free(seg_starts);
     free(seg_ends);
     return 0;
@@ -658,7 +667,6 @@ int execute_pipeline(Token *start) {
       if (resolved == NULL) {
         const char *display = (argv[0][0] == '%') ? argv[0] + 1 : argv[0];
         fprintf(stderr, "cshell: command not found (%s)\n", display);
-        all_found = 0;
         free(argv);
 
         pids[i] = fork();
@@ -670,9 +678,19 @@ int execute_pipeline(Token *start) {
       }
     }
 
+    /* Opened just before this stage's fork and closed right after, so
+       no later stage inherits them. */
+    if (redirs_open(seg_starts[i], seg_ends[i], &redirs[i]) != 0) {
+      free(resolved);
+      free(argv);
+      pids[i] = -1;
+      continue;
+    }
+
     pids[i] = fork();
     if (pids[i] < 0) {
       perror("fork");
+      redirs_close(&redirs[i]);
       free(resolved);
       free(argv);
       pids[i] = -1;
@@ -693,8 +711,8 @@ int execute_pipeline(Token *start) {
         close(pipefds[j][1]);
       }
 
-      if (apply_segment_redirs(seg_starts[i], seg_ends[i]) < 0)
-        _exit(1);
+      /* File redirections override the pipe ends set up above. */
+      redirs_install(&redirs[i]);
 
       if (is_builtin) {
         /* Run the built-in directly in this child process */
@@ -731,6 +749,7 @@ int execute_pipeline(Token *start) {
 
     if (pgid == 0) pgid = pids[i];
     setpgid(pids[i], pgid);
+    redirs_close(&redirs[i]);
 
     free(resolved);
     free(argv);
@@ -750,18 +769,26 @@ int execute_pipeline(Token *start) {
   token_group_to_string(start, cmdline, sizeof(cmdline));
 
   term_give(pgid);
-  fg_wait(pgid, pids, names, n_cmds, cmdline);
+  int stopped = fg_wait(pgid, pids, names, n_cmds, cmdline);
+
+  /* Every stage has exited, so each tee has seen EOF and each feeder has
+     finished or lost its reader.  A stopped job's helpers are still
+     needed; check_bg_jobs reaps them later. */
+  if (!stopped)
+    for (int i = 0; i < n_cmds; i++)
+      redirs_wait(&redirs[i]);
 
   /* ── 7. Cleanup ──────────────────────────────────────────────────── */
   signal(SIGPIPE, old_handler);
   free(pids);
   free(names);
+  free(redirs);
   if (pipefds)
     free(pipefds);
   free(seg_starts);
   free(seg_ends);
 
-  return all_found ? 0 : 1;
+  return 0;
 }
 
 /* ================================================================== */
@@ -829,7 +856,7 @@ pid_t execute_pipeline_bg(Token *start, pid_t *out_pids,
 
   /* ── 3. Validate redirections for each segment ───────────────────── */
   for (int i = 0; i < n_cmds; i++) {
-    if (!validate_segment_redirs(seg_starts[i], seg_ends[i])) {
+    if (!redirs_validate(seg_starts[i], seg_ends[i])) {
       free(seg_starts);
       free(seg_ends);
       signal(SIGPIPE, old_handler);
@@ -932,9 +959,20 @@ pid_t execute_pipeline_bg(Token *start, pid_t *out_pids,
       }
     }
 
+    /* Nobody waits on a background job, so its feeder/tee helpers are
+       reaped by check_bg_jobs, which ignores pids it does not track. */
+    Redirs redirs;
+    if (redirs_open(seg_starts[i], seg_ends[i], &redirs) != 0) {
+      free(resolved);
+      free(argv);
+      pids[i] = -1;
+      continue;
+    }
+
     pids[i] = fork();
     if (pids[i] < 0) {
       perror("fork");
+      redirs_close(&redirs);
       free(resolved);
       free(argv);
       pids[i] = -1;
@@ -944,6 +982,8 @@ pid_t execute_pipeline_bg(Token *start, pid_t *out_pids,
     if (pids[i] == 0) {
       /* ── Child ──────────────────────────────────────────────────── */
       setpgid(0, pgid);
+      /* Undo the SIGPIPE ignore above, which would survive execve. */
+      signal(SIGPIPE, SIG_DFL);
 
       int devnull = open("/dev/null", O_RDONLY);
       if (devnull >= 0) {
@@ -961,8 +1001,7 @@ pid_t execute_pipeline_bg(Token *start, pid_t *out_pids,
         close(pipefds[j][1]);
       }
 
-      if (apply_segment_redirs(seg_starts[i], seg_ends[i]) < 0)
-        _exit(1);
+      redirs_install(&redirs);
 
       if (is_builtin) {
         if (strcmp(argv[0], "peek") == 0) {
@@ -998,6 +1037,7 @@ pid_t execute_pipeline_bg(Token *start, pid_t *out_pids,
 
     if (pgid == 0) pgid = pids[i];
     setpgid(pids[i], pgid);
+    redirs_close(&redirs);
     record_bg_stage(out_pids, out_names, out_cap, &rec, pids[i], argv[0]);
 
     free(resolved);

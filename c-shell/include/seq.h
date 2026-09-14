@@ -22,8 +22,9 @@ int run_sequence(TokenList *tokens, HopEntry *db, int *db_size);
 
 /* Redirection helpers shared with bg.c (used by built-in commands). */
 typedef struct {
-  int saved_stdin;
-  int saved_stdout;
+  int    saved_stdin;
+  int    saved_stdout;
+  Redirs redirs;       /* feeder/tee helpers, reaped by undo_redirections */
 } SavedFds;
 
 int  apply_redirections(Token *start, SavedFds *saved);

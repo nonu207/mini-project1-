@@ -17,6 +17,49 @@
 char *resolve_command(const char *name);
 
 /**
+ * The redirections of one command, opened and ready to install.
+ *
+ *   in_fd / out_fd  become the command's stdin / stdout (-1: unchanged).
+ *   helper[0]       feeder process that joins several < files, in order,
+ *                   into one stream (0 when unused)
+ *   helper[1]       tee process that copies output into several > / >>
+ *                   files, each with its own mode (0 when unused)
+ *
+ * A single < or > is a plain file descriptor with no helper.
+ */
+typedef struct {
+  int   in_fd;
+  int   out_fd;
+  pid_t helper[2];
+} Redirs;
+
+/**
+ * Check every redirection target in [start, end) (stopping early at ; or &).
+ * Prints the spec's error message and returns 0 on the first failure,
+ * 1 if all targets can be opened.  > files are created/truncated here.
+ */
+int redirs_validate(Token *start, Token *end);
+
+/**
+ * Open the redirections of [start, end), forking a feeder for multiple <
+ * and a tee for multiple > / >>.  Call after redirs_validate.
+ * Returns 0 on success, -1 on failure (nothing is left open).
+ */
+int redirs_open(Token *start, Token *end, Redirs *r);
+
+/** dup2 the opened fds onto stdin/stdout and close the originals. */
+void redirs_install(Redirs *r);
+
+/** Close the opened fds without installing them (e.g. parent after fork). */
+void redirs_close(Redirs *r);
+
+/**
+ * Reap the feeder/tee helpers.  Call only once every holder of the
+ * redirection fds has closed them, or the tee never sees EOF.
+ */
+void redirs_wait(const Redirs *r);
+
+/**
  * Execute a single external command via fork/exec, with redirection support.
  *
  * @param argc   Argument count (argv[0] is the command name)
@@ -30,8 +73,12 @@ int execute_command(int argc, char **argv, Token *start);
  * Execute a pipeline of commands connected by pipes.
  * Handles per-command < > redirections as well.
  *
+ * A stage whose command is not found prints its error, and the rest of the
+ * pipeline still runs.  Per spec C4 this is not a failed command, so it
+ * never stops a ; sequence.
+ *
  * @param start  First token of this command group (scans up to ; or & or end)
- * @return  0 if every pipeline stage was found; 1 otherwise
+ * @return  0 always
  */
 int execute_pipeline(Token *start);
 

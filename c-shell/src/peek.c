@@ -49,9 +49,8 @@ static void peek_forward(FILE *f, int flag_n, int *line_num) {
 /* assigns ORIGINAL forward line numbers (so they are preserved when   */
 /* printed in reverse), then prints in reverse order.                  */
 /*                                                                      */
-/* Used for:                                                            */
-/*   • stdin/pipes with -r (always, since they are not seekable)       */
-/*   • regular files with -r -n (original numbers must be kept)        */
+/* Used only for non-seekable input with -r (stdin, pipes, FIFOs).     */
+/* Regular files go through peek_reverse_seekable instead.             */
 /* ------------------------------------------------------------------ */
 static void peek_reverse_buffered(FILE *f, int flag_n, int *line_num) {
     /* Dynamic array of lines */
@@ -110,16 +109,59 @@ static void peek_reverse_buffered(FILE *f, int flag_n, int *line_num) {
 }
 
 /* ------------------------------------------------------------------ */
-/* peek_reverse_seekable: reads regular file backwards in chunks.      */
-/* Only used when -r is set WITHOUT -n (so no line number tracking     */
-/* is needed and we can read purely backwards).                         */
+/* count_nonempty_lines: forward pass over fd in fixed-size chunks,    */
+/* counting lines that contain a non-whitespace character. Nothing is  */
+/* stored, so memory use stays constant regardless of file size.       */
 /* ------------------------------------------------------------------ */
-static void peek_reverse_seekable(int fd) {
+static int count_nonempty_lines(int fd) {
+    char    buf[CHUNK_SIZE];
+    int     count       = 0;
+    int     has_content = 0; /* current line has a non-space char */
+    ssize_t n;
+
+    lseek(fd, 0, SEEK_SET);
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        for (ssize_t k = 0; k < n; k++) {
+            if (buf[k] == '\n') {
+                count += has_content;
+                has_content = 0;
+            } else if (!isspace((unsigned char)buf[k])) {
+                has_content = 1;
+            }
+        }
+    }
+    return count + has_content; /* last line may lack a trailing '\n' */
+}
+
+/* ------------------------------------------------------------------ */
+/* emit_reverse_line: print one line (without '\n') during a reverse   */
+/* read. Numbers count down, since lines arrive last-to-first.         */
+/* ------------------------------------------------------------------ */
+static void emit_reverse_line(const char *text, int flag_n, int *next_num) {
+    if (flag_n && !is_empty_line(text))
+        printf("%d %s\n", (*next_num)--, text);
+    else
+        printf("%s\n", text);
+}
+
+/* ------------------------------------------------------------------ */
+/* peek_reverse_seekable: reads regular file backwards in chunks.      */
+/*                                                                      */
+/* With -n, a forward counting pass finds how many numbered lines the  */
+/* file has, so the last line can be given its ORIGINAL number and the */
+/* numbers counted down from there — no need to buffer the file.       */
+/* ------------------------------------------------------------------ */
+static void peek_reverse_seekable(int fd, int flag_n, int *line_num) {
     struct stat st;
     if (fstat(fd, &st) != 0) return;
 
     off_t filesize = st.st_size;
     if (filesize == 0) return;
+
+    /* Number that the last non-empty line of this file will get */
+    int total    = flag_n ? count_nonempty_lines(fd) : 0;
+    int next_num = *line_num + total - 1;
+    *line_num   += total; /* the next file continues after this one */
 
     char   buf[CHUNK_SIZE];
     off_t  pos      = filesize;
@@ -168,7 +210,7 @@ static void peek_reverse_seekable(int fd) {
 
             if (i >= 0) {
                 /* We hit a '\n' — full_line is a complete line */
-                printf("%s\n", full_line);
+                emit_reverse_line(full_line, flag_n, &next_num);
                 free(full_line);
                 i--; /* move past the '\n' for next iteration */
             } else {
@@ -178,10 +220,13 @@ static void peek_reverse_seekable(int fd) {
         }
     }
 
-    /* Flush any text from the very beginning of the file */
+    /* Flush any text from the very beginning of the file. If nothing is
+     * left over, the file began with '\n', so its first line is empty. */
     if (leftover != NULL) {
-        printf("%s\n", leftover);
+        emit_reverse_line(leftover, flag_n, &next_num);
         free(leftover);
+    } else if (pos == 0) {
+        emit_reverse_line("", flag_n, &next_num);
     }
 }
 
@@ -213,25 +258,15 @@ static void process_file(const char *filename, int flag_n, int flag_r,
 
     /* ── Dispatch ────────────────────────────────────────────────────── */
     if (flag_r) {
-        if (flag_n) {
-            /*
-             * -r + -n: we must preserve ORIGINAL line numbers even when
-             * printing in reverse, so we buffer the whole file first.
-             */
-            FILE *f = fopen(filename, "r");
-            if (f != NULL) {
-                peek_reverse_buffered(f, flag_n, line_num);
-                fclose(f);
-            }
-        } else if (S_ISREG(st.st_mode)) {
-            /* -r only on a seekable regular file: use the chunk reader */
+        if (S_ISREG(st.st_mode)) {
+            /* Seekable regular file: read backwards with lseek chunks */
             int fd = open(filename, O_RDONLY);
             if (fd >= 0) {
-                peek_reverse_seekable(fd);
+                peek_reverse_seekable(fd, flag_n, line_num);
                 close(fd);
             }
         } else {
-            /* -r only on a non-seekable source */
+            /* Non-seekable source (e.g. a FIFO): buffering is allowed */
             FILE *f = fopen(filename, "r");
             if (f != NULL) {
                 peek_reverse_buffered(f, flag_n, line_num);

@@ -76,9 +76,9 @@ void activities(int argc, char **argv) {
   }
 
   /* Spec: processes that have exited must be removed before printing.
-     Reusing the shell's single reaper keeps one waitpid() path -- two
-     independent reapers would race to consume each other's statuses
-     and lose completion messages. */
+     check_bg_jobs is the one place statuses reach the job table (both the
+     SIGCHLD handler's queue and its own sweep) -- a separate reaper here
+     would race it for statuses and lose completion messages. */
   check_bg_jobs();
 
   int njobs = bg_live_count();

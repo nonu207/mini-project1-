@@ -93,6 +93,12 @@ static void resume_fg(const BgJob *job, int timeout_secs) {
   strncpy(cmdline, job->cmdline, sizeof(cmdline) - 1);
   cmdline[sizeof(cmdline) - 1] = '\0';
 
+  /* We wait on these processes ourselves below, so the SIGCHLD handler
+     must stop reaping them first.  bg_set_stopped re-watches any that
+     stop again. */
+  for (int i = 0; i < n; i++)
+    bg_unwatch_pid(pids[i]);
+
   /* Spec: print the command line, as a normal foreground launch would. */
   printf("%s\n", cmdline);
   fflush(stdout);

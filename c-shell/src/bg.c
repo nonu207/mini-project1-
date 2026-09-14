@@ -14,15 +14,101 @@ static BgJob bg_jobs[MAX_BG_JOBS];
 static int   n_jobs          = 0;   /* live jobs */
 static int   next_job_number = 0;   /* monotonic; never decremented */
 
-/* ── SIGCHLD handler ───────────────────────────────────────────────── */
-/* A no-op handler is required so SIGCHLD interrupts blocking system    */
-/* calls (fgets in main, waitpid in exec) with EINTR instead of being   */
-/* silently ignored.  No SA_RESTART: this is what wakes the shell while */
-/* waiting for user input so it can report background completions.      */
-/* All reaping + reporting happens in check_bg_jobs (main context).     */
-/* ------------------------------------------------------------------- */
+/* ── SIGCHLD reaping ───────────────────────────────────────────────── */
+/* Spec: the SIGCHLD handler itself reaps terminated background          */
+/* processes with waitpid() and WNOHANG.  It must never reap a            */
+/* foreground child -- fg_wait, resume fg and snoop wait on those by pid  */
+/* -- so it only waits on the pids in `watched`: processes of tracked     */
+/* jobs that nothing else is waiting on.  printf is not async-signal-     */
+/* safe, so the handler only queues (pid, status); check_bg_jobs reports  */
+/* them from main context.  The job table is still touched only there.    */
+/*                                                                          */
+/* No SA_RESTART: the signal also interrupts fgets in main with EINTR,     */
+/* which is what lets a completion be reported while waiting for input.    */
+#define MAX_WATCH (MAX_BG_JOBS * MAX_JOB_PROCS)
+
+static volatile pid_t        watched[MAX_WATCH];  /* 0 marks a free slot */
+static volatile sig_atomic_t watch_hi = 0;         /* in use: [0, watch_hi) */
+
+static volatile pid_t        reaped_pid[MAX_WATCH];
+static volatile int          reaped_status[MAX_WATCH];
+static volatile sig_atomic_t reaped_n = 0;
+
 static void sigchld_handler(int sig) {
   (void)sig;
+  int saved_errno = errno;  /* don't clobber errno under main's feet */
+
+  for (int i = 0; i < watch_hi && reaped_n < MAX_WATCH; i++) {
+    pid_t pid = watched[i];
+    if (pid <= 0)
+      continue;
+    int status;
+    /* WNOHANG: never block.  No WUNTRACED: a stopped job stays put. */
+    if (waitpid(pid, &status, WNOHANG) == pid) {
+      watched[i] = 0;
+      reaped_pid[reaped_n] = pid;
+      reaped_status[reaped_n] = status;
+      reaped_n++;
+    }
+  }
+
+  errno = saved_errno;
+}
+
+/* Keep the handler out while main context edits the watch list or
+   drains the queue. */
+static void block_sigchld(sigset_t *old) {
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGCHLD);
+  sigprocmask(SIG_BLOCK, &set, old);
+}
+
+static void restore_sigmask(const sigset_t *old) {
+  sigprocmask(SIG_SETMASK, old, NULL);
+}
+
+void bg_watch_pid(pid_t pid) {
+  if (pid <= 0)
+    return;
+  sigset_t old;
+  block_sigchld(&old);
+
+  int slot = -1;
+  for (int i = 0; i < watch_hi; i++) {
+    if (watched[i] == pid) {        /* already watched */
+      restore_sigmask(&old);
+      return;
+    }
+    if (watched[i] == 0 && slot < 0)
+      slot = i;
+  }
+  if (slot < 0 && watch_hi < MAX_WATCH)
+    slot = watch_hi++;
+  /* A full list leaves the pid unwatched; check_bg_jobs's sweep still
+     reaps it from main context. */
+  if (slot >= 0)
+    watched[slot] = pid;
+
+  restore_sigmask(&old);
+}
+
+int bg_unwatch_pid(pid_t pid) {
+  sigset_t old;
+  block_sigchld(&old);
+
+  int was_watched = 0;
+  for (int i = 0; i < watch_hi; i++) {
+    if (watched[i] == pid) {
+      watched[i] = 0;
+      was_watched = 1;
+    }
+  }
+  while (watch_hi > 0 && watched[watch_hi - 1] == 0)
+    watch_hi--;
+
+  restore_sigmask(&old);
+  return was_watched;
 }
 
 /* ── Public API ────────────────────────────────────────────────────── */
@@ -31,6 +117,8 @@ void init_bg(void) {
   memset(bg_jobs, 0, sizeof(bg_jobs));
   n_jobs = 0;
   next_job_number = 0;
+  watch_hi = 0;
+  reaped_n = 0;
 
   struct sigaction sa;
   sa.sa_handler = sigchld_handler;
@@ -73,6 +161,10 @@ static BgJob *add_job(pid_t pgid, const pid_t *pids,
                                                            : j->lead_name;
   strncpy(j->cmdline, cl, BG_CMD_MAX - 1);
   j->cmdline[BG_CMD_MAX - 1] = '\0';
+
+  /* From now on the SIGCHLD handler reaps these processes. */
+  for (int i = 0; i < n; i++)
+    bg_watch_pid(pids[i]);
   return j;
 }
 
@@ -137,6 +229,9 @@ void register_bg_job(pid_t pid, const char *name, const char *cmdline) {
 }
 
 int bg_child_exited(pid_t pid, int status) {
+  /* The pid is gone, however it was reaped. */
+  bg_unwatch_pid(pid);
+
   for (int i = 0; i < n_jobs; i++) {
     BgJob *j = &bg_jobs[i];
 
@@ -191,10 +286,32 @@ int bg_child_exited(pid_t pid, int status) {
 }
 
 int check_bg_jobs(void) {
-  int status;
-  pid_t pid;
   int reported = 0;
 
+  /* 1. Report what the SIGCHLD handler has reaped.  Copy the queue out
+        with SIGCHLD blocked so the handler cannot append mid-copy. */
+  static pid_t pids[MAX_WATCH];
+  static int   statuses[MAX_WATCH];
+  sigset_t old;
+  block_sigchld(&old);
+  int n = reaped_n;
+  for (int i = 0; i < n; i++) {
+    pids[i]     = reaped_pid[i];
+    statuses[i] = reaped_status[i];
+  }
+  reaped_n = 0;
+  restore_sigmask(&old);
+
+  for (int i = 0; i < n; i++)
+    reported += bg_child_exited(pids[i], statuses[i]);
+
+  /* 2. Sweep up children the handler does not watch: the feeder/tee
+        helpers of background redirections, and a job that exited before
+        its pid was watched (its SIGCHLD came too early to match).  This
+        runs only from main context with no foreground wait in progress,
+        so it cannot take a foreground child. */
+  int status;
+  pid_t pid;
   while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
     reported += bg_child_exited(pid, status);
   return reported;
@@ -253,12 +370,19 @@ void bg_set_stopped(int job_number, const pid_t *pids, int n) {
     j->procs[i] = kept[i];
   j->nprocs  = kn;
   j->stopped = 1;
+
+  /* resume fg stops watching a job while it waits on it; hand the
+     processes that stopped again back to the SIGCHLD handler. */
+  for (int i = 0; i < kn; i++)
+    bg_watch_pid(j->procs[i].pid);
 }
 
 void bg_remove_job(int job_number) {
   for (int i = 0; i < n_jobs; i++) {
     if (bg_jobs[i].job_number != job_number)
       continue;
+    for (int k = 0; k < bg_jobs[i].nprocs; k++)
+      bg_unwatch_pid(bg_jobs[i].procs[k].pid);
     for (int m = i; m < n_jobs - 1; m++)   /* keep the array dense */
       bg_jobs[m] = bg_jobs[m + 1];
     n_jobs--;

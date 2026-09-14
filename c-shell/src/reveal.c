@@ -123,12 +123,15 @@ static void list_recursive(const char *abs_path, const char *prefix, int show_hi
         else
             snprintf(display, sizeof(display), "%s/%s", prefix, entries[i]);
 
-        /* If this entry is itself a directory, recurse into it */
+        /* If this entry is itself a directory, recurse into it. lstat
+         * (not stat) so a symlink to a directory is listed as a plain
+         * entry and never followed — otherwise a link like "loop -> .."
+         * would recurse forever, which ls -R also avoids. */
         char child_abs[PATH_MAX];
         snprintf(child_abs, sizeof(child_abs), "%s/%s", abs_path, entries[i]);
 
         struct stat st;
-        int is_dir = (stat(child_abs, &st) == 0 && S_ISDIR(st.st_mode));
+        int is_dir = (lstat(child_abs, &st) == 0 && S_ISDIR(st.st_mode));
 
         /* Print with trailing '/' for directories, plain name for files */
         if (is_dir)
