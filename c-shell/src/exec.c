@@ -99,8 +99,10 @@ char *resolve_command(const char *name) {
   if (!percent_skip) {
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof(cwd)) != NULL) {
-      snprintf(fullpath, sizeof(fullpath), "%s/%s", cwd, lookup);
-      if (check_executable(fullpath))
+      /* Skip, rather than probe, a path truncated to fit PATH_MAX. */
+      int len = snprintf(fullpath, sizeof(fullpath), "%s/%s", cwd, lookup);
+      if (len >= 0 && (size_t)len < sizeof(fullpath) &&
+          check_executable(fullpath))
         return strdup(fullpath);
     }
   }
@@ -645,6 +647,7 @@ int execute_pipeline(Token *start) {
                       strcmp(argv[0], "locate") == 0 ||
                       strcmp(argv[0], "hop") == 0 ||
                       strcmp(argv[0], "activities") == 0 ||
+                      strcmp(argv[0], "ping") == 0 ||
                     strcmp(argv[0], "resume") == 0);
 
     char *resolved = NULL;
@@ -703,6 +706,8 @@ int execute_pipeline(Token *start) {
           activities(argc, argv);
         } else if (strcmp(argv[0], "resume") == 0) {
           resume(argc, argv);
+        } else if (strcmp(argv[0], "ping") == 0) {
+          ping(argc, argv);
         } else if (strcmp(argv[0], "hop") == 0) {
           HopEntry db[MAX_HOP_ENTRIES];
           int db_size = 0;
@@ -773,8 +778,7 @@ static void record_bg_stage(pid_t *out_pids, char (*out_names)[256],
   if (out_pids == NULL || out_names == NULL || *rec >= out_cap)
     return;
   out_pids[*rec] = pid;
-  strncpy(out_names[*rec], name, 255);
-  out_names[*rec][255] = '\0';
+  snprintf(out_names[*rec], 256, "%s", name);
   (*rec)++;
 }
 
@@ -893,6 +897,7 @@ pid_t execute_pipeline_bg(Token *start, pid_t *out_pids,
                       strcmp(argv[0], "locate") == 0 ||
                       strcmp(argv[0], "hop") == 0 ||
                       strcmp(argv[0], "activities") == 0 ||
+                      strcmp(argv[0], "ping") == 0 ||
                     strcmp(argv[0], "resume") == 0);
 
     char *resolved = NULL;
@@ -962,6 +967,8 @@ pid_t execute_pipeline_bg(Token *start, pid_t *out_pids,
           activities(argc, argv);
         } else if (strcmp(argv[0], "resume") == 0) {
           resume(argc, argv);
+        } else if (strcmp(argv[0], "ping") == 0) {
+          ping(argc, argv);
         } else if (strcmp(argv[0], "hop") == 0) {
           HopEntry db[MAX_HOP_ENTRIES];
           int db_size = 0;

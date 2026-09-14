@@ -205,6 +205,21 @@ static int run_group(Token *start, HopEntry *db, int *db_size) {
   }
 
   if (!has_pipe && start->type == TOKEN_WORD &&
+      strcmp(start->value, "ping") == 0) {
+    int argc = 0;
+    char **argv = extract_group(start, &argc);
+    if (argv != NULL) {
+      SavedFds saved;
+      if (apply_redirections(start, &saved) == 0) {
+        ping(argc, argv);
+        undo_redirections(&saved);
+      }
+      free(argv);
+    }
+    return 0;
+  }
+
+  if (!has_pipe && start->type == TOKEN_WORD &&
       strcmp(start->value, "activities") == 0) {
     int argc = 0;
     char **argv = extract_group(start, &argc);

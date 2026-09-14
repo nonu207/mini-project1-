@@ -23,8 +23,10 @@ static int locate_one(const char *name) {
     /* ── 1. Check the current working directory first ──────────────── */
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof(cwd)) != NULL) {
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", cwd, name);
-        if (check_exec(fullpath)) {
+        /* Skip, rather than probe, a path truncated to fit PATH_MAX. */
+        int len = snprintf(fullpath, sizeof(fullpath), "%s/%s", cwd, name);
+        if (len >= 0 && (size_t)len < sizeof(fullpath) &&
+            check_exec(fullpath)) {
             printf("%s\n", fullpath);
             found = 1;
         }

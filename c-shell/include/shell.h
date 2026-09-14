@@ -13,6 +13,7 @@
 #include "locate.h"
 #include "activities.h"
 #include "resume.h"
+#include "ping.h"
 #include "term.h"
 
 /* ── Standard library headers ─────────────────────────────────────── */

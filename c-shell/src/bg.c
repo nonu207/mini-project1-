@@ -352,6 +352,7 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
                     strcmp(argv[0], "locate") == 0 ||
                     strcmp(argv[0], "hop") == 0 ||
                     strcmp(argv[0], "activities") == 0 ||
+                    strcmp(argv[0], "ping") == 0 ||
                     strcmp(argv[0], "resume") == 0);
 
   char *resolved = NULL;
@@ -401,6 +402,8 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
         activities(argc, argv);
       } else if (strcmp(argv[0], "resume") == 0) {
         resume(argc, argv);
+      } else if (strcmp(argv[0], "ping") == 0) {
+        ping(argc, argv);
       } else if (strcmp(argv[0], "hop") == 0) {
         /* Load a fresh copy of the db; the child's chdir does not
            affect the parent shell's working directory anyway.      */
