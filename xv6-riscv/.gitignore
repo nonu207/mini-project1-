@@ -1,0 +1,14 @@
+*~
+_*
+*.o
+*.d
+*.asm
+*.sym
+*.img
+/mkfs/mkfs
+/kernel/kernel
+/user/usys.S
+.gdbinit
+TAGS
+.cache/
+compile_commands.json
