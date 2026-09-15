@@ -970,6 +970,22 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
 // Print a process listing to console.  For debugging.
 // Runs when user types ^P on console.
 // No lock to avoid wedging a stuck machine further.
+//
+// The first line says which scheduler this kernel was built with and the current tick count, so
+// one Ctrl+P is enough to tell an RR kernel from an MLFQ kernel. Under MLFQ it also shows how many
+// ticks have passed since the last priority boost. The boost runs whenever ticks is a multiple of
+// 48, so that number is simply ticks % 48, and it drops back to 0 right after each boost.
+//
+// Then there is one line per process: PID, name and state, followed under MLFQ by the scheduler
+// bookkeeping for that process:
+//   queue  the priority level it is in, 0 (highest) to 3 (lowest)
+//   slice  ticks used so far in its current slice, out of the slice length for that queue
+//   stamp  its arrival stamp; inside one queue, the smallest stamp is the front of the queue
+//
+// Pressing Ctrl+P a few times while a test runs shows the rules in action: a CPU-bound process
+// walks down the queues as its slices run out, an I/O-bound process stays in a high queue, and
+// after each boost (since boost goes back to a small number) every process is in queue 0 again.
+// printk has no column widths, so every value is labeled instead of lined up in columns.
 void
 procdump(void)
 {
@@ -987,6 +1003,11 @@ procdump(void)
   char *state;
 
   printk("\n");
+#ifdef USE_MLFQ
+  printk("scheduler=MLFQ ticks=%u since_boost=%u/48\n", ticks, ticks % 48);
+#else
+  printk("scheduler=RR ticks=%u\n", ticks);
+#endif
   for (p = proc; p < &proc[NPROC]; p++) {
     if (p->state == UNUSED)
       continue;
@@ -994,7 +1015,11 @@ procdump(void)
       state = states[p->state];
     else
       state = "???";
-    printk("%d %s %s", p->pid, state, p->name);
+    printk("pid=%d name=%s state=%s", p->pid, p->name, state);
+#ifdef USE_MLFQ
+    printk(" queue=%d slice=%d/%d stamp=%lu", p->queue, p->ticks_used, time_slice[p->queue],
+           p->enq_time);
+#endif
     printk("\n");
   }
 }

@@ -1,12 +1,9 @@
 #include "shell.h"
 
-/* ------------------------------------------------------------------ */
-/* Timeout plumbing.                                                    */
-/*                                                                      */
-/* The handler only raises a flag: the wait below is a blocking         */
-/* waitpid(), and SIGALRM without SA_RESTART makes it fail with EINTR,  */
-/* which is what lets us notice the timeout at all.                     */
-/* ------------------------------------------------------------------ */
+/* Set by alarm_handler when the resume --timeout timer fires. The
+ * handler only raises this flag; the blocking waitpid it interrupts,
+ * combined with SIGALRM having no SA_RESTART, is what lets the timeout
+ * be noticed at all. */
 static volatile sig_atomic_t alarm_fired = 0;
 
 static void alarm_handler(int sig) {
@@ -14,12 +11,11 @@ static void alarm_handler(int sig) {
   alarm_fired = 1;
 }
 
-/* ------------------------------------------------------------------ */
-/* parse_job_number: the spec syntax is "%job_number", so accept only   */
-/* '%' followed by decimal digits.  Returns the number, or -1 if the    */
-/* syntax is wrong.  "%0" or a huge number is well formed: it simply    */
-/* names no job, which the caller reports as "no such job".             */
-/* ------------------------------------------------------------------ */
+/* Parses a job number argument. The required syntax is a percent sign
+ * followed by decimal digits, so anything else is invalid syntax and
+ * returns -1. "%0" or an unreasonably large number parses successfully
+ * but simply names no real job, which the caller reports as no such
+ * job rather than a syntax error. */
 static int parse_job_number(const char *s) {
   if (s == NULL || *s != '%')
     return -1;
@@ -31,16 +27,16 @@ static int parse_job_number(const char *s) {
   for (const char *p = s; *p != '\0'; p++) {
     if (!isdigit((unsigned char)*p))
       return -1;
-    /* Past any real job number: stop growing, so it cannot overflow. */
+    /* Once past any value a real job number could have, stop growing
+     * the number so it cannot overflow. */
     if (value <= 1000000)
       value = value * 10 + (*p - '0');
   }
   return value;
 }
 
-/* ------------------------------------------------------------------ */
-/* parse_seconds: strictly positive integer seconds for --timeout.      */
-/* ------------------------------------------------------------------ */
+/* Parses a strictly positive integer number of seconds for --timeout.
+ * Returns 0 if the string is not a valid positive integer. */
 static int parse_seconds(const char *s) {
   if (s == NULL || *s == '\0')
     return 0;
@@ -55,9 +51,9 @@ static int parse_seconds(const char *s) {
   return value;
 }
 
-/* ------------------------------------------------------------------ */
-/* resume_bg: mark Running and return to the prompt at once.            */
-/* ------------------------------------------------------------------ */
+/* Resumes a job in the background: marks it Running, sends SIGCONT to
+ * its process group, prints the confirmation line, and returns to the
+ * prompt at once without waiting on the job or touching the terminal. */
 static void resume_bg(const BgJob *job) {
   int    job_number = job->job_number;
   pid_t  pgid       = job->pgid;
@@ -69,17 +65,13 @@ static void resume_bg(const BgJob *job) {
   bg_set_running(job_number);
   kill(-pgid, SIGCONT);
 
-  /* Spec: "[job_number] + Running command" */
   printf("[%d] + Running %s\n", job_number, cmdline);
   fflush(stdout);
-  /* Spec: do NOT wait, and do NOT touch the terminal. */
 }
 
-/* ------------------------------------------------------------------ */
-/* resume_fg: hand the job the terminal and wait for it.                */
-/*                                                                      */
-/* timeout_secs of 0 means "no timer".                                  */
-/* ------------------------------------------------------------------ */
+/* Resumes a job in the foreground: hands it the terminal, continues it,
+ * and waits for it to finish or stop again. A timeout_secs of 0 means
+ * no timer is armed. */
 static void resume_fg(const BgJob *job, int timeout_secs) {
   int   job_number = job->job_number;
   pid_t pgid       = job->pgid;
@@ -87,41 +79,41 @@ static void resume_fg(const BgJob *job, int timeout_secs) {
   pid_t pids[MAX_JOB_PROCS];
   char  cmdline[BG_CMD_MAX];
 
-  /* Copy everything out first: the table may be mutated below, which
-     would invalidate `job`. */
+  /* Everything needed is copied out first, because the job table may be
+   * mutated below in ways that would invalidate the job pointer. */
   for (int i = 0; i < n; i++)
     pids[i] = job->procs[i].pid;
   strncpy(cmdline, job->cmdline, sizeof(cmdline) - 1);
   cmdline[sizeof(cmdline) - 1] = '\0';
 
-  /* We wait on these processes ourselves below, so the SIGCHLD handler
-     must stop reaping them first.  bg_set_stopped re-watches any that
-     stop again. */
+  /* This function waits on these processes itself below, so the
+   * SIGCHLD handler must stop reaping them first. bg_set_stopped will
+   * hand any that stop again back to the handler. */
   for (int i = 0; i < n; i++)
     bg_unwatch_pid(pids[i]);
 
-  /* Spec: print the command line, as a normal foreground launch would. */
   printf("%s\n", cmdline);
   fflush(stdout);
 
   bg_set_running(job_number);
 
-  /* Spec: give the job the terminal, then continue it.  Ordering
-     matters -- a job that resumes and immediately reads the terminal
-     would take SIGTTIN if it were not already the foreground group. */
+  /* The terminal is handed over before the job is continued. Doing it
+   * in the other order would mean the job could read the terminal
+   * before it is the foreground group, which would earn it a SIGTTIN. */
   term_give(pgid);
   kill(-pgid, SIGCONT);
 
-  /* Clear unconditionally, not just when arming a timer: a leftover 1
-     from an earlier resume would otherwise be read as a timeout the
-     next time waitpid is interrupted by an unrelated SIGCHLD. */
+  /* Cleared unconditionally rather than only when a timer is armed, so
+   * a flag left over from an earlier resume is never mistaken for a
+   * timeout the next time waitpid is interrupted by an unrelated
+   * SIGCHLD. */
   alarm_fired = 0;
 
   struct sigaction sa, old_alarm;
   if (timeout_secs > 0) {
     sa.sa_handler = alarm_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;                /* no SA_RESTART: we need the EINTR */
+    sa.sa_flags = 0;
     sigaction(SIGALRM, &sa, &old_alarm);
     alarm((unsigned int)timeout_secs);
   }
@@ -140,51 +132,50 @@ static void resume_fg(const BgJob *job, int timeout_secs) {
         if (WIFSTOPPED(status))
           stopped[sn++] = pids[i];
         else
-          pids[i] = 0;              /* exited and reaped */
+          pids[i] = 0;
         break;
       }
       if (r < 0 && errno == EINTR) {
-        /* Only a timer we actually armed can time this job out. */
+        /* Only a timer actually armed here can time this job out. */
         if (timeout_secs > 0 && alarm_fired) {
           timed_out = 1;
           break;
         }
-        continue;                   /* a background SIGCHLD; keep waiting */
+        continue;
       }
       pids[i] = 0;
-      break;                        /* ECHILD: already reaped */
+      break;
     }
   }
 
   if (timeout_secs > 0) {
-    /* Spec: cancel the pending timer when the job settles first. */
     alarm(0);
     sigaction(SIGALRM, &old_alarm, NULL);
   }
 
   if (timed_out) {
     kill(-pgid, SIGTERM);
-    /* Do not wait for the group to die here: a job that ignores SIGTERM
-       would hang the shell forever.  Reclaim the terminal and report now. */
+    /* The group is not waited for here, because a job that ignores
+     * SIGTERM would otherwise hang the shell forever. The terminal is
+     * reclaimed and the timeout reported right away. */
     term_take();
     fprintf(stderr, "resume: job timed out\n");
-    /* Spec: a timed out job has been terminated, so drop it.  Its
-       processes still need reaping once they exit, so hand the live ones
-       back to the SIGCHLD handler; with no job owning them any more, they
-       are reaped silently. */
+    /* A timed out job has been terminated, so it is dropped from the
+     * job table. Its processes still need to be reaped once they
+     * actually exit, so they are handed back to the SIGCHLD handler;
+     * with no job owning them any more they are reaped silently. */
     bg_remove_job(job_number);
     for (int i = 0; i < n; i++)
-      bg_watch_pid(pids[i]);        /* ignores the 0s already reaped */
+      bg_watch_pid(pids[i]);
     return;
   }
 
   term_take();
 
-  /* Spec: only stopped jobs stay in the list. */
   if (sn > 0) {
     bg_set_stopped(job_number, stopped, sn);
     if (term_is_tty())
-      printf("\n");                 /* end the echoed "^Z" line */
+      printf("\n");
     printf("[%d] + Stopped %s\n", job_number, cmdline);
     fflush(stdout);
   } else {
@@ -192,11 +183,10 @@ static void resume_fg(const BgJob *job, int timeout_secs) {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* resume — main entry point                                           */
-/* ------------------------------------------------------------------ */
+/* Implements the resume command. Accepts "resume %N fg", "resume %N
+ * bg", and "resume %N fg --timeout S", validates the syntax and looks
+ * up the job before dispatching to resume_fg or resume_bg. */
 void resume(int argc, char **argv) {
-  /* resume %N fg | resume %N bg | resume %N fg --timeout S */
   if (argc < 3 || argc > 5) {
     fprintf(stderr, "resume: invalid syntax\n");
     return;
@@ -220,7 +210,7 @@ void resume(int argc, char **argv) {
 
   int timeout_secs = 0;
   if (argc > 3) {
-    /* --timeout is only meaningful with fg, and needs exactly one arg. */
+    /* --timeout only makes sense with fg, and needs exactly one value. */
     if (!is_fg || argc != 5 || strcmp(argv[3], "--timeout") != 0) {
       fprintf(stderr, "resume: invalid syntax\n");
       return;

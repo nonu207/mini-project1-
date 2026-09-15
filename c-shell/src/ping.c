@@ -1,13 +1,12 @@
 #include "shell.h"
 
-/* ------------------------------------------------------------------ */
-/* parse_signal: signal_number must be one or more decimal digits.      */
-/* A leading '-' or '+' is invalid syntax, not a value to reduce.       */
-/*                                                                      */
-/* The modulo is folded in digit by digit, so an arbitrarily long       */
-/* number never overflows: (v * 10 + d) % 64 == ((v % 64) * 10 + d) % 64.*/
-/* Returns the reduced signal (0..63), or -1 on invalid syntax.         */
-/* ------------------------------------------------------------------ */
+/* Parses a signal number argument, which must be one or more decimal
+ * digits; a leading plus or minus sign makes it invalid syntax rather
+ * than a value to reduce. The result is folded down to the range 0 to
+ * 63 digit by digit as it is parsed, using the identity that
+ * (v * 10 + d) % 64 equals ((v % 64) * 10 + d) % 64, so an arbitrarily
+ * long string of digits never overflows. Returns the reduced signal
+ * number, or -1 if the string is not valid syntax. */
 static int parse_signal(const char *s) {
   if (s == NULL || *s == '\0')
     return -1;
@@ -21,10 +20,10 @@ static int parse_signal(const char *s) {
   return reduced;
 }
 
-/* ------------------------------------------------------------------ */
-/* parse_positive: a strictly positive decimal integer, or 0 if the     */
-/* string is anything else.  Used for both pids and job numbers.        */
-/* ------------------------------------------------------------------ */
+/* Parses a strictly positive decimal integer, used for both pids and
+ * job numbers. Returns the value, or 0 if the string is empty, contains
+ * anything other than digits, or is larger than any real pid or job
+ * number could be. */
 static long parse_positive(const char *s) {
   if (s == NULL || *s == '\0')
     return 0;
@@ -35,14 +34,13 @@ static long parse_positive(const char *s) {
       return 0;
     value = value * 10 + (*p - '0');
     if (value > 0x7fffffffL)
-      return 0;                     /* larger than any pid or job number */
+      return 0;
   }
   return value;
 }
 
-/* ------------------------------------------------------------------ */
-/* find_job_by_pid: the tracked job that owns a live process `pid`.     */
-/* ------------------------------------------------------------------ */
+/* Finds the tracked job that a live process with the given pid belongs
+ * to, or NULL if no tracked job has that pid. */
 static const BgJob *find_job_by_pid(pid_t pid) {
   int njobs = bg_live_count();
   for (int i = 0; i < njobs; i++) {
@@ -56,41 +54,59 @@ static const BgJob *find_job_by_pid(pid_t pid) {
   return NULL;
 }
 
+/* Reports whether a signal is one that stops a process. */
 static int is_stop_signal(int sig) {
   return sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU;
 }
 
-/* ------------------------------------------------------------------ */
-/* ping — main entry point                                             */
-/* ------------------------------------------------------------------ */
+/* Implements the ping command, which sends a signal to a tracked pid or
+ * job. The signal number is validated before the target is looked up,
+ * so a bad signal number is always reported as invalid syntax even if
+ * the target itself does not exist.
+ *
+ * A target starting with a percent sign names a job number, and the
+ * signal is sent to that job's whole process group; otherwise the
+ * target is a plain pid and the signal is sent to that process alone.
+ * Only pids and jobs this shell itself spawned and is still tracking
+ * are valid targets. Anything else, including a pid that exists on the
+ * system but was not spawned by this shell, is reported as unknown.
+ *
+ * After a successful send, the job table's own idea of whether the job
+ * is stopped or running is updated to match, so that activities and the
+ * Ctrl-D check see the new state even on systems where the process
+ * state cannot be read from /proc. A single pid only speaks for its
+ * whole job when that job has exactly one process.
+ *
+ * On success the signal number is echoed back exactly as it was typed,
+ * not the value it was reduced to modulo 64. */
 void ping(int argc, char **argv) {
   if (argc != 3) {
     fprintf(stderr, "ping: invalid syntax\n");
     return;
   }
 
-  /* Spec: validate signal_number BEFORE looking up the target. */
   int sig = parse_signal(argv[2]);
   if (sig < 0) {
     fprintf(stderr, "ping: invalid syntax\n");
     return;
   }
 
-  /* Reap anything that has already exited, so a finished process is not
-     mistaken for a tracked one (a zombie would still accept kill()). */
+  /* Anything that has already exited is reaped first, so a finished
+   * process is never mistaken for a live tracked one; a zombie would
+   * otherwise still accept a signal from kill(). */
   check_bg_jobs();
 
   const char *target = argv[1];
   int by_job = (target[0] == '%');
   const BgJob *job = NULL;
-  pid_t dest = 0;                   /* argument for kill() */
+  pid_t dest = 0;
 
   if (by_job) {
     long num = parse_positive(target + 1);
     if (num > 0)
       job = bg_find_job((int)num);
     if (job != NULL && job->nprocs > 0)
-      dest = -job->pgid;            /* negative pid == whole group */
+      dest = -job->pgid;
   } else {
     long pid = parse_positive(target);
     if (pid > 0)
@@ -99,8 +115,6 @@ void ping(int argc, char **argv) {
       dest = (pid_t)pid;
   }
 
-  /* Spec: only pids/jobs this shell spawned and still tracks count; any
-     other pid, even one that exists on the system, is unknown. */
   if (dest == 0) {
     fprintf(stderr, "ping: no such process found\n");
     return;
@@ -111,9 +125,6 @@ void ping(int argc, char **argv) {
     return;
   }
 
-  /* Keep the job table's notion of Stopped/Running in sync, so activities
-     and the Ctrl-D check see the change even where /proc is unavailable.
-     A single pid only speaks for its job when it is the whole job. */
   if (job->nprocs > 0 && (by_job || job->nprocs == 1)) {
     int job_number = job->job_number;
     if (sig == SIGCONT) {
@@ -127,7 +138,6 @@ void ping(int argc, char **argv) {
     }
   }
 
-  /* Spec: echo the signal number exactly as typed, not the reduced one. */
   printf("Sent signal %s to %s\n", argv[2], target);
   fflush(stdout);
 }

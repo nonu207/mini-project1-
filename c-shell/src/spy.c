@@ -2,13 +2,13 @@
 
 static pid_t shell_pid = 0;
 
+/* Records the shell's own pid at startup, before any fork, so a bare
+ * spy with no argument has something to report on. */
 void spy_init(void) {
   shell_pid = getpid();
 }
 
-/* ------------------------------------------------------------------ */
-/* mode_type: lsof's TYPE column for a stat() mode.                     */
-/* ------------------------------------------------------------------ */
+/* Maps a stat() mode to the TYPE column lsof would print for it. */
 static const char *mode_type(mode_t m) {
   if (S_ISREG(m))  return "REG";
   if (S_ISDIR(m))  return "DIR";
@@ -20,10 +20,9 @@ static const char *mode_type(mode_t m) {
   return "UNKNOWN";
 }
 
-/* ------------------------------------------------------------------ */
-/* read_link: readlink() that NUL-terminates.  readlink never does, and */
-/* silently truncates, so one byte is held back for the terminator.     */
-/* ------------------------------------------------------------------ */
+/* Reads a symlink into buf and NUL-terminates it. readlink never
+ * terminates its result and silently truncates it if the buffer is too
+ * small, so one byte of the buffer is held back for the terminator. */
 static int read_link(const char *link, char *buf, size_t size) {
   ssize_t n = readlink(link, buf, size - 1);
   if (n < 0)
@@ -32,21 +31,23 @@ static int read_link(const char *link, char *buf, size_t size) {
   return 0;
 }
 
-/* Columns as in the spec: pid, 4 spaces, then FD and TYPE padded to 7. */
+/* Prints one row in the spy output format: the pid, four spaces, then
+ * the FD and TYPE columns padded to a fixed width, followed by the
+ * path. */
 static void print_row(pid_t pid, const char *fd, const char *type,
                       const char *path) {
   printf("%d    %-6s %-6s %s\n", (int)pid, fd, type, path);
 }
 
-/* ------------------------------------------------------------------ */
-/* show_link: one row for a /proc/<pid>/<name> magic link.              */
-/*                                                                      */
-/* PATH comes from readlink(); TYPE from stat() on the link itself.     */
-/* The kernel resolves a magic link to the open object, not to its      */
-/* name, so stat() still works for pipes, sockets and deleted files --  */
-/* where "pipe:[123]" or "foo (deleted)" is not a path that exists.     */
-/* Entries we may not read (another user's process) are skipped.        */
-/* ------------------------------------------------------------------ */
+/* Prints one row for a /proc/<pid>/<name> magic link, such as cwd, exe,
+ * or one of the numbered entries under fd. The path comes from reading
+ * the link itself, and the type comes from stat() on the link, which
+ * the kernel resolves to the underlying open object rather than to a
+ * name on disk. That is what makes stat() still work for a pipe, a
+ * socket, or a file that has since been deleted, where the link's
+ * target text, such as "pipe:[123]" or "foo (deleted)", is not itself a
+ * path that exists. A link belonging to a process this shell is not
+ * allowed to read is simply skipped. */
 static void show_link(pid_t pid, const char *name, const char *fd_label) {
   char link[64];
   char target[PATH_MAX];
@@ -57,23 +58,23 @@ static void show_link(pid_t pid, const char *name, const char *fd_label) {
   const char *type = "UNKNOWN";
   struct stat st;
   if (strncmp(target, "anon_inode:", 11) == 0)
-    type = "a_inode";               /* eventfd, epoll, ...: no file type */
+    type = "a_inode";
   else if (stat(link, &st) == 0)
     type = mode_type(st.st_mode);
 
   print_row(pid, fd_label, type, target);
 }
 
-/* ------------------------------------------------------------------ */
-/* show_mem: one row per unique file mapped into the process.           */
-/*                                                                      */
-/* /proc/<pid>/maps has one line per mapping:                           */
-/*   address perms offset dev inode [pathname]                          */
-/* A library appears several times (text, rodata, data segments), so    */
-/* paths already printed are skipped.  Only real paths count: "[heap]", */
-/* "[stack]", "[vdso]" and anonymous mappings have no file.  The        */
-/* executable is also mapped, but is already reported as txt.           */
-/* ------------------------------------------------------------------ */
+/* Prints one row per unique file memory-mapped into a process.
+ * /proc/<pid>/maps has one line per mapping, giving the address range,
+ * permissions, offset, device, inode and, if the mapping is
+ * file-backed, a pathname. A shared library typically appears several
+ * times for its text, read-only data and writable data segments, so
+ * paths already printed are skipped. Entries such as [heap], [stack],
+ * [vdso] and anonymous mappings have no real path and are ignored. The
+ * process's own executable is mapped too, but it has already been
+ * reported separately as the txt entry, so it is skipped here if its
+ * path is known. */
 static void show_mem(pid_t pid, const char *exe) {
   char maps[64];
   snprintf(maps, sizeof(maps), "/proc/%d/maps", (int)pid);
@@ -88,8 +89,9 @@ static void show_mem(pid_t pid, const char *exe) {
   size_t  linecap = 0;
 
   while (getline(&line, &linecap, fp) > 0) {
-    /* Skip the five fixed fields; the path, if any, is the rest of the
-       line and may itself contain spaces. */
+    /* The first five fields are skipped; whatever remains on the line
+     * is the pathname, if there is one, and it may itself contain
+     * spaces. */
     int off = -1;
     sscanf(line, "%*s %*s %*s %*s %*s %n", &off);
     if (off < 0)
@@ -121,9 +123,10 @@ static void show_mem(pid_t pid, const char *exe) {
       break;
     seen[nseen++] = copy;
 
-    /* A file-backed mapping is a regular file unless stat() says
-       otherwise (e.g. /dev/zero).  stat() fails for a mapped file that
-       has since been deleted, which is still a regular file. */
+    /* A file-backed mapping is treated as a regular file unless stat()
+     * says otherwise, such as for /dev/zero. stat() can fail for a
+     * mapped file that has since been deleted, which is still, in
+     * effect, a regular file. */
     struct stat st;
     const char *type = (stat(file, &st) == 0) ? mode_type(st.st_mode) : "REG";
     print_row(pid, "mem", type, file);
@@ -142,11 +145,10 @@ static int cmp_int(const void *a, const void *b) {
   return (x > y) - (x < y);
 }
 
-/* ------------------------------------------------------------------ */
-/* show_fds: one row per open descriptor, in ascending order.           */
-/* readdir() returns /proc/<pid>/fd in no promised order, so the        */
-/* numbers are collected and sorted first.                              */
-/* ------------------------------------------------------------------ */
+/* Prints one row per open file descriptor of a process, in ascending
+ * numeric order. readdir() returns the entries of /proc/<pid>/fd in no
+ * particular order, so the descriptor numbers are collected first and
+ * sorted before anything is printed. */
 static void show_fds(pid_t pid) {
   char dir[64];
   snprintf(dir, sizeof(dir), "/proc/%d/fd", (int)pid);
@@ -161,7 +163,7 @@ static void show_fds(pid_t pid) {
 
   while ((e = readdir(d)) != NULL) {
     if (!isdigit((unsigned char)e->d_name[0]))
-      continue;                     /* "." and ".." */
+      continue;
     char *end;
     long v = strtol(e->d_name, &end, 10);
     if (*end != '\0' || v < 0 || v > INT_MAX)
@@ -178,9 +180,11 @@ static void show_fds(pid_t pid) {
     fds[n++] = (int)v;
   }
 
-  /* Close BEFORE reading the links.  When spying on ourselves this very
-     directory stream is an open descriptor; once closed, its link is
-     gone, readlink() fails, and spy does not report its own scaffolding. */
+  /* The directory is closed before its entries' links are read. When
+   * spying on the shell's own process, this very directory stream is
+   * itself an open descriptor, and once it is closed its link
+   * disappears, so readlink() on it fails and spy does not report its
+   * own scaffolding as an open file. */
   closedir(d);
 
   qsort(fds, n, sizeof(*fds), cmp_int);
@@ -194,14 +198,15 @@ static void show_fds(pid_t pid) {
   free(fds);
 }
 
-/* ------------------------------------------------------------------ */
-/* is_zombie: has the process exited, leaving only its /proc entry      */
-/* until the parent reaps it?  A zombie has released every open file,   */
-/* so it no longer corresponds to a process spy can report on.          */
-/*                                                                      */
-/* State is the field after "(comm)" in /proc/<pid>/stat.  comm may     */
-/* itself contain ')', so the LAST ')' ends it.                         */
-/* ------------------------------------------------------------------ */
+/* Reports whether a process has already exited and is only present as
+ * a zombie waiting for its parent to reap it. A zombie has released
+ * every open file, so it no longer corresponds to anything spy can
+ * usefully report on.
+ *
+ * The state character is the field right after the parenthesized
+ * command name in /proc/<pid>/stat. Since that name may itself contain
+ * a closing parenthesis, the last one in the line is used to find the
+ * end of the name field. */
 static int is_zombie(pid_t pid) {
   char path[64];
   snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
@@ -219,9 +224,11 @@ static int is_zombie(pid_t pid) {
   return end[2] == 'Z' || end[2] == 'X';
 }
 
-/* ------------------------------------------------------------------ */
-/* spy — main entry point                                              */
-/* ------------------------------------------------------------------ */
+/* Implements the spy command. With no argument it reports on the shell
+ * itself; with one argument it reports on that pid. Prints the working
+ * directory, executable, memory-mapped files and open descriptors of
+ * the target process, in the same style as lsof. Requires /proc to be
+ * available and the target to be a real, non-zombie process. */
 void spy(int argc, char **argv) {
   if (argc > 2) {
     fprintf(stderr, "spy: invalid syntax\n");
@@ -246,7 +253,7 @@ void spy(int argc, char **argv) {
       if (!too_big) {
         value = value * 10 + (*p - '0');
         if (value > INT_MAX)
-          too_big = 1;              /* a number, just not any pid */
+          too_big = 1;
       }
     }
     pid = too_big ? 0 : (pid_t)value;

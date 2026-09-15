@@ -1,5 +1,6 @@
 #include "shell.h"
 
+/* Returns a human-readable name for a token type, used for debugging. */
 const char *token_type_name(TokenType type) {
   switch (type) {
   case TOKEN_WORD:
@@ -21,6 +22,7 @@ const char *token_type_name(TokenType type) {
   }
 }
 
+/* Allocates a new token node with the given type and a copy of value. */
 static Token *create_token_node(TokenType type, const char *value) {
   Token *node = (Token *)malloc(sizeof(Token));
   if (node == NULL) {
@@ -38,6 +40,7 @@ static Token *create_token_node(TokenType type, const char *value) {
   return node;
 }
 
+/* Appends a token node to the end of a token list. */
 static void append_token(TokenList *token_list, Token *node) {
   if (token_list == NULL || node == NULL) {
     return;
@@ -52,25 +55,35 @@ static void append_token(TokenList *token_list, Token *node) {
   token_list->count++;
 }
 
+/* Splits an input line into a list of tokens: words and the operators
+ * pipe, ampersand, greater-than, double greater-than, less-than and
+ * semicolon. Whitespace outside quotes separates tokens and is
+ * otherwise ignored. Operators are recognized with maximal munch, so
+ * two consecutive greater-than characters are read as one append-
+ * redirection token rather than two separate ones.
+ *
+ * Inside a word, a backslash escapes the character that follows it
+ * literally, single quotes take everything inside them as literal
+ * text with no escapes, and double quotes take everything inside them
+ * literally except for an escaped quote or an escaped backslash. A
+ * trailing backslash at the end of the line, or an unclosed single or
+ * double quote, is a syntax error.
+ *
+ * Returns 0 on success, or -1 on a syntax error or allocation failure,
+ * after printing an error message and freeing any tokens already
+ * collected. */
 int tokenize(const char *input, TokenList *token_list) {
   if (input == NULL || token_list == NULL) {
     return -1;
   }
 
-  // Initialize token list
   token_list->head = NULL;
   token_list->tail = NULL;
   token_list->count = 0;
 
-  // Pointer to current position in input string that gets moved forward as
-  // tokens are processed used cuz look ahead is clean and convenient and for
-  // operators we need to check if its >> or > or << or < etc. p will be updated
-  // as we scan the input string and hence we dont need a separate index
-  // variable
   const char *p = input;
 
   while (*p != '\0') {
-    // 1. Handle Whitespace: Spaces, tabs, newlines outside quotes are ignored
     while (*p != '\0' && isspace((unsigned char)*p)) {
       p++;
     }
@@ -79,14 +92,11 @@ int tokenize(const char *input, TokenList *token_list) {
       break;
     }
 
-    // 2. Identify Special Characters / Operators with "Maximal Munch"
-    // Per spec: special -> | & > < ;   Only >> is a multi-char operator.
     if (*p == '|' || *p == '&' || *p == '>' || *p == '<' || *p == ';') {
       TokenType op_type;
       char op_str[3] = {0};
 
       if (*p == '>' && *(p + 1) == '>') {
-        // Maximal munch: >> is one OP_GTGT token, not two OP_GT
         op_type = TOKEN_OP_GTGT;
         op_str[0] = '>';
         op_str[1] = '>';
@@ -125,9 +135,10 @@ int tokenize(const char *input, TokenList *token_list) {
       continue;
     }
 
-    // 3. Parse WORD token (Handles Quotes & Escapes character by character)
-    size_t buf_capacity = 64; // initially buffer size is 64 bytes
-    size_t buf_len = 0;       // length of the buffer
+    /* A word is built up character by character into a growable
+     * buffer, since its length is not known in advance. */
+    size_t buf_capacity = 64;
+    size_t buf_len = 0;
     char *buf = (char *)malloc(buf_capacity);
     if (buf == NULL) {
       perror("malloc");
@@ -138,27 +149,21 @@ int tokenize(const char *input, TokenList *token_list) {
     int syntax_error = 0;
 
     while (*p != '\0') {
-      // Unquoted whitespace or operator marks the end of the WORD
+      /* Unquoted whitespace or an operator character ends the word. */
       if (isspace((unsigned char)*p) || *p == '|' || *p == '&' || *p == '>' ||
           *p == '<' || *p == ';') {
         break;
       }
 
-      // Case A: Unquoted Escapes (\c)
+      /* An unquoted backslash escapes the next character literally. */
       if (*p == '\\') {
-        p++; // Skip backslash
+        p++;
         if (*p == '\0') {
-          // Trailing backslash at line end
           syntax_error = 1;
           break;
         }
-        // Append next character literally
-        // dynamic buffer, ensures that program does not overflow memory while
-        // building tokens of unknown length
         if (buf_len + 1 >= buf_capacity) {
-          buf_capacity *=
-              2; // achieves O(1) amortized time complexity, otherwise will have
-                 // to call realloc again and again and program will be slow
+          buf_capacity *= 2;
           char *new_buf = (char *)realloc(buf, buf_capacity);
           if (new_buf == NULL) {
             perror("realloc");
@@ -174,9 +179,10 @@ int tokenize(const char *input, TokenList *token_list) {
         continue;
       }
 
-      // Case B: Single Quotes ('...') - Everything inside is literal text
+      /* Inside single quotes, everything up to the closing quote is
+       * taken literally, with no escapes recognized. */
       if (*p == '\'') {
-        p++; // Skip opening single quote
+        p++;
         while (*p != '\0' && *p != '\'') {
           if (buf_len + 1 >= buf_capacity) {
             buf_capacity *= 2;
@@ -194,17 +200,17 @@ int tokenize(const char *input, TokenList *token_list) {
           p++;
         }
         if (*p == '\0') {
-          // Unclosed single quote before line ends
           syntax_error = 1;
           break;
         }
-        p++; // Skip closing single quote
+        p++;
         continue;
       }
 
-      // Case C: Double Quotes ("...") - Process \" and \\ escapes
+      /* Inside double quotes, an escaped quote or an escaped backslash
+       * is unescaped; anything else is taken literally. */
       if (*p == '"') {
-        p++; // Skip opening double quote
+        p++;
         while (*p != '\0' && *p != '"') {
           if (*p == '\\') {
             if (*(p + 1) == '\0') {
@@ -212,8 +218,6 @@ int tokenize(const char *input, TokenList *token_list) {
               break;
             }
 
-            // this part handles double backlash and also when /", in both we
-            // skip the first backlash
             if (*(p + 1) == '"' || *(p + 1) == '\\') {
               p++;
             }
@@ -236,11 +240,11 @@ int tokenize(const char *input, TokenList *token_list) {
           syntax_error = 1;
           break;
         }
-        p++; // Skip closing double quote
+        p++;
         continue;
       }
 
-      // Case D: Regular character inside word
+      /* An ordinary character inside a word. */
       if (buf_len + 1 >= buf_capacity) {
         buf_capacity *= 2;
         char *new_buf = (char *)realloc(buf, buf_capacity);
@@ -277,13 +281,9 @@ int tokenize(const char *input, TokenList *token_list) {
   return 0;
 }
 
-/**
- * Free all allocated token memory in linked list
- */
-// without this every other command which is entered will leave an orphaned
-// memory on the heap, leading to memory leaks which can cause program to
-// eventually crash basically it cleans up the heap by removing all the
-// allocated memory
+/* Frees every token node in the list and resets it to empty. This must
+ * be called after each command line is processed, or the memory for
+ * its tokens and their string values would leak. */
 void free_tokens(TokenList *token_list) {
   if (token_list == NULL) {
     return;
@@ -293,8 +293,7 @@ void free_tokens(TokenList *token_list) {
   while (current != NULL) {
     Token *next = current->next;
     if (current->value != NULL) {
-      free(current->value); // without this string memory for a token is lost
-                            // forever in RAM
+      free(current->value);
       current->value = NULL;
     }
     free(current);
@@ -306,160 +305,126 @@ void free_tokens(TokenList *token_list) {
   token_list->count = 0;
 }
 
-// void print_tokens(const TokenList *token_list) {
-//   if (token_list == NULL || token_list->head == NULL) {
-//     printf("No tokens\n");
-//     return;
-//   }
-//   printf("Parsed %d tokens:\n", token_list->count);
-//   int i = 0;
-//   for (const Token *curr = token_list->head; curr != NULL;
-//        curr = curr->next, i++) {
-//     printf("  [%d] %-12s: \"%s\"\n", i, token_type_name(curr->type),
-//            curr->value);
-//   }
-// }
-
-/* -----------------------------------------------------------------------
- * Grammar Validator
+/* Grammar validator.
  *
- * Implements a recursive descent validator over the token linked list for:
+ * Implements a recursive descent check over the token list for this
+ * grammar:
  *
- *   LINE  ->  epsilon | WORD ARG
- *   ARG   ->  epsilon | WORD ARG | OP_LT TGT | OP_GT TGT | OP_GTGT TGT
+ *   LINE  -> epsilon | WORD ARG
+ *   ARG   -> epsilon | WORD ARG | OP_LT TGT | OP_GT TGT | OP_GTGT TGT
  *                     | OP_PIPE CMD | OP_SEMI CMD | OP_AMP BG
- *   CMD   ->  WORD ARG
- *   TGT   ->  WORD ARG
- *   BG    ->  epsilon | WORD ARG
+ *   CMD   -> WORD ARG
+ *   TGT   -> WORD ARG
+ *   BG    -> epsilon | WORD ARG
  *
- * Each parse_*() function receives a Token** cursor and advances it as
- * tokens are consumed.  Returns 0 on success, -1 on grammar error.
- * ----------------------------------------------------------------------- */
+ * Each parse function below takes a cursor into the token list and
+ * advances it as tokens are consumed. Every function returns 0 on
+ * success or -1 on a grammar error. */
 
-/* Forward declarations for mutual recursion */
-static int parse_arg(Token **curr); // argument following the first word
-static int parse_cmd(Token **curr); // another command after | or ;
-static int parse_tgt(Token **curr); // target of redirection
-static int parse_bg(Token **curr);  // background command
+static int parse_arg(Token **curr);
+static int parse_cmd(Token **curr);
+static int parse_tgt(Token **curr);
+static int parse_bg(Token **curr);
 
-/* Helper: emit a grammar error and return -1 */
+/* Prints the fixed grammar error message and returns -1. The token
+ * that triggered the error is accepted as an argument for future
+ * debugging, but the spec requires the same fixed message regardless
+ * of where the error occurred. */
 static int grammar_error(const char *near) {
-  (void)near; /* near is available for debugging but spec requires fixed msg */
+  (void)near;
   fprintf(stderr, "cshell: invalid syntax\n");
   return -1;
 }
 
-/*
- * ARG -> epsilon
- *      | WORD    ARG
- *      | OP_LT   TGT
- *      | OP_GT   TGT
- *      | OP_GTGT TGT
- *      | OP_PIPE CMD
- *      | OP_SEMI CMD
- *      | OP_AMP  BG
- */
+/* Parses the ARG rule: after the first word, the rest of the line may
+ * be empty, another word, a redirection followed by its target, or a
+ * pipe, semicolon or ampersand followed by the next command. Any other
+ * operator appearing here has nothing valid to follow it and is a
+ * grammar error. */
 static int parse_arg(Token **curr) {
-  /* ARG -> epsilon : nothing more to consume, valid */
   if (*curr == NULL) {
     return 0;
   }
 
   switch ((*curr)->type) {
 
-  /* ARG -> WORD ARG */
   case TOKEN_WORD:
-    *curr = (*curr)->next; /* consume WORD */
+    *curr = (*curr)->next;
     return parse_arg(curr);
 
-  /* ARG -> OP_LT TGT  or  OP_GT TGT  or  OP_GTGT TGT */
   case TOKEN_OP_LT:
   case TOKEN_OP_GT:
   case TOKEN_OP_GTGT:
-    *curr = (*curr)->next; /* consume the redirect operator */
+    *curr = (*curr)->next;
     return parse_tgt(curr);
 
-  /* ARG -> OP_PIPE CMD  or  OP_SEMI CMD */
   case TOKEN_OP_PIPE:
   case TOKEN_OP_SEMI:
-    *curr = (*curr)->next; /* consume | or ; */
+    *curr = (*curr)->next;
     return parse_cmd(curr);
 
-  /* ARG -> OP_AMP BG */
   case TOKEN_OP_AMP:
-    *curr = (*curr)->next; /* consume & */
+    *curr = (*curr)->next;
     return parse_bg(curr);
 
-  /* Anything else (OP_LTLT, OP_AMPAMP, OP_PIPEPIPE) cannot legally appear
-   * in ARG position without a preceding WORD, so it is a grammar error. */
   default:
     return grammar_error((*curr)->value);
   }
 }
 
-/*
- * CMD -> WORD ARG
- * (used after OP_PIPE and OP_SEMI — must start with a WORD)
- */
+/* Parses the CMD rule, used after a pipe or semicolon: the next token
+ * must be a word naming a command, followed by its own arguments. */
 static int parse_cmd(Token **curr) {
   if (*curr == NULL || (*curr)->type != TOKEN_WORD) {
-    /* Nothing or a non-WORD token where a command name is required */
     return grammar_error(*curr ? (*curr)->value : NULL);
   }
-  *curr = (*curr)->next; /* consume WORD */
+  *curr = (*curr)->next;
   return parse_arg(curr);
 }
 
-/*
- * TGT -> WORD ARG
- * (used after OP_LT / OP_GT / OP_GTGT — must name a file/word)
- */
+/* Parses the TGT rule, used after a redirection operator: the next
+ * token must be a word naming the redirection target. */
 static int parse_tgt(Token **curr) {
   if (*curr == NULL || (*curr)->type != TOKEN_WORD) {
     return grammar_error(*curr ? (*curr)->value : NULL);
   }
-  *curr = (*curr)->next; /* consume WORD */
+  *curr = (*curr)->next;
   return parse_arg(curr);
 }
 
-/*
- * BG -> epsilon | WORD ARG
- * (used after OP_AMP — the rest of the line is optional)
- */
+/* Parses the BG rule, used after an ampersand: the rest of the line is
+ * optional, but if anything follows it must be a word starting a new
+ * command. Any operator directly after an ampersand is a grammar
+ * error. */
 static int parse_bg(Token **curr) {
   if (*curr == NULL) {
-    return 0; /* BG -> epsilon */
+    return 0;
   }
   if ((*curr)->type == TOKEN_WORD) {
-    *curr = (*curr)->next; /* consume WORD */
+    *curr = (*curr)->next;
     return parse_arg(curr);
   }
-  /* Any operator token directly after & is a grammar error */
   return grammar_error((*curr)->value);
 }
 
-/*
- * LINE -> epsilon | WORD ARG
- * Public entry point.
- */
+/* Public entry point for grammar validation. An empty line is valid;
+ * otherwise the line must begin with a word. */
 int validate_grammar(const TokenList *token_list) {
   if (token_list == NULL || token_list->head == NULL) {
-    return 0; /* LINE -> epsilon */
+    return 0;
   }
 
   Token *curr = token_list->head;
 
-  /* LINE must begin with a WORD */
   if (curr->type != TOKEN_WORD) {
     return grammar_error(curr->value);
   }
-  curr = curr->next; /* consume leading WORD */
+  curr = curr->next;
   return parse_arg(&curr);
 }
 
-/* ------------------------------------------------------------------ */
-/* token_group_to_string: rebuild a group's command line as written.   */
-/* ------------------------------------------------------------------ */
+/* Returns the text form of a redirection or pipe operator, or NULL for
+ * any other token type. */
 static const char *op_text(TokenType type) {
   switch (type) {
   case TOKEN_OP_PIPE: return "|";
@@ -470,6 +435,11 @@ static const char *op_text(TokenType type) {
   }
 }
 
+/* Rebuilds one command group's text as the user originally typed it,
+ * up to the next semicolon or ampersand, writing the result into out.
+ * Used to display or record a job's command line, for example in the
+ * activities and resume output. If the result would not fit in the
+ * buffer, it is truncated rather than overflowing. */
 void token_group_to_string(Token *start, char *out, size_t size) {
   if (out == NULL || size == 0)
     return;
@@ -486,7 +456,7 @@ void token_group_to_string(Token *start, char *out, size_t size) {
 
     size_t plen = strlen(piece);
     if (len + plen + (len ? 1 : 0) + 1 > size)
-      break;                      /* truncate rather than overflow */
+      break;
     if (len)
       out[len++] = ' ';
     memcpy(out + len, piece, plen);

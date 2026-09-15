@@ -1,12 +1,9 @@
 #include "shell.h"
 
-/* ------------------------------------------------------------------ */
-/* Build a NULL-terminated argv[] from ONE command group only.         */
-/* Stops at the first operator ( ; & < > >> | ) or end of list.        */
-/* Caller must free() the returned pointer.                            */
-/* ------------------------------------------------------------------ */
+/* Builds a NULL-terminated argv array from one command group, stopping
+ * at the first operator (semicolon, ampersand, redirection, or pipe) or
+ * the end of the token list. The caller must free the returned array. */
 static char **extract_group(Token *start, int *out_argc) {
-  /* Count words in this command group (before any operator) */
   int word_count = 0;
   Token *t = start;
   while (t != NULL) {
@@ -40,48 +37,49 @@ static char **extract_group(Token *start, int *out_argc) {
   return argv;
 }
 
-/* ------------------------------------------------------------------ */
-/* Redirection helpers for built-in commands.                          */
-/* Applies < > >> from the token list to the shell's own fds, using    */
-/* the same feeder/tee helpers as external commands (see exec.c), so   */
-/* several < files form one stream and every > / >> file gets output.  */
-/* Returns 0 on success, -1 on error (caller must not run builtin).    */
-/* Caller must call undo_redirections() afterwards.                    */
-/* ------------------------------------------------------------------ */
+/* Applies a builtin's redirections, using the same feeder and tee
+ * helpers external commands use, so several input files are joined
+ * into one stream and every output file receives the full output.
+ * Returns 0 on success, in which case the caller must eventually call
+ * undo_redirections, or -1 on error, in which case the builtin must not
+ * be run. */
 int apply_redirections(Token *start, SavedFds *saved) {
   if (!redirs_validate(start, NULL))
     return -1;
   if (redirs_open(start, NULL, &saved->redirs) != 0)
     return -1;
 
-  fflush(stdout);  /* earlier output must not end up in the files */
+  /* Output already produced must not end up inside the redirected
+   * files, so it is flushed first. */
+  fflush(stdout);
   saved->saved_stdin  = dup(STDIN_FILENO);
   saved->saved_stdout = dup(STDOUT_FILENO);
   redirs_install(&saved->redirs);
   return 0;
 }
 
+/* Restores the shell's own stdin and stdout after a builtin ran with
+ * redirections applied. Once the shell's pipe ends are closed here, any
+ * tee helper sees end of file and any feeder whose data the builtin
+ * never read receives SIGPIPE, so both exit on their own; this waits
+ * for that to happen. */
 void undo_redirections(const SavedFds *saved) {
   fflush(stdout);
   dup2(saved->saved_stdout, STDOUT_FILENO);
   close(saved->saved_stdout);
   dup2(saved->saved_stdin, STDIN_FILENO);
   close(saved->saved_stdin);
-  /* Restoring dropped the shell's pipe ends: a tee now sees EOF, and a
-     feeder whose data the built-in never read gets SIGPIPE.  Both exit. */
   redirs_wait(&saved->redirs);
 }
 
-/* ------------------------------------------------------------------ */
-/* run_group: execute one ;-separated command group starting at start. */
-/* Returns 1 if the sequence must stop (a command was not found),      */
-/* otherwise 0. Built-ins, pipelines, and external commands handled.   */
-/* ------------------------------------------------------------------ */
+/* Runs one command group, which is everything up to the next semicolon
+ * or ampersand. Dispatches to a builtin, a pipeline, or a single
+ * external command as appropriate. Returns 1 if the sequence must stop
+ * because a command was not found, otherwise 0. */
 static int run_group(Token *start, HopEntry *db, int *db_size) {
   if (start == NULL)
     return 0;
 
-  /* Does this group contain a pipe? (scan stops at ; or &) */
   int has_pipe = 0;
   for (Token *t = start; t != NULL; t = t->next) {
     if (t->type == TOKEN_OP_SEMI || t->type == TOKEN_OP_AMP)
@@ -92,7 +90,10 @@ static int run_group(Token *start, HopEntry *db, int *db_size) {
     }
   }
 
-  /* ── Built-in commands (only when NOT in a pipeline) ──────────────── */
+  /* Each builtin below is only recognized when the group has no pipe,
+   * since a builtin inside a pipeline is instead handled as one of the
+   * pipeline's own stages. */
+
   if (!has_pipe && start->type == TOKEN_WORD &&
       strcmp(start->value, "hop") == 0) {
     int argc = 0;
@@ -230,11 +231,9 @@ static int run_group(Token *start, HopEntry *db, int *db_size) {
     return 0;
   }
 
-  /* ── Pipeline ─────────────────────────────────────────────────────── */
   if (has_pipe)
     return execute_pipeline(start);
 
-  /* ── Single external command ──────────────────────────────────────── */
   int argc = 0;
   char **argv = extract_group(start, &argc);
   if (argv != NULL && argc > 0) {
@@ -245,24 +244,21 @@ static int run_group(Token *start, HopEntry *db, int *db_size) {
   return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* run_sequence: iterate over every ;/& separated group and run it.   */
-/*                                                                      */
-/* The operator that FOLLOWS a group determines how it runs:           */
-/*   ;  or end-of-input  → foreground (blocking); stop on not-found.  */
-/*   &                   → background (non-blocking); always continue. */
-/* ------------------------------------------------------------------ */
+/* Runs every semicolon- and ampersand-separated group in a tokenized
+ * line, in order. The operator that follows a group decides how it
+ * runs: a semicolon or the end of input runs it in the foreground and
+ * blocks until it finishes, stopping the whole sequence if the command
+ * was not found; an ampersand runs it in the background and always
+ * continues on to the next group regardless of the outcome. */
 int run_sequence(TokenList *tokens, HopEntry *db, int *db_size) {
   Token *group = tokens->head;
 
   while (group != NULL) {
-    /* A command group always starts with a WORD token. */
     if (group->type != TOKEN_WORD) {
       group = group->next;
       continue;
     }
 
-    /* ── Find the operator that ends this group ────────────────────── */
     Token *op = group;
     while (op != NULL &&
            op->type != TOKEN_OP_SEMI &&
@@ -270,15 +266,12 @@ int run_sequence(TokenList *tokens, HopEntry *db, int *db_size) {
       op = op->next;
 
     if (op != NULL && op->type == TOKEN_OP_AMP) {
-      /* ── Background ──────────────────────────────────────────────── */
       run_bg_group(group, db, db_size);
     } else {
-      /* ── Foreground (sequential) ─────────────────────────────────── */
       if (run_group(group, db, db_size) != 0)
-        break;  /* command not found – stop the sequence */
+        break;
     }
 
-    /* Advance past the operator (or exit if at end) */
     group = (op != NULL) ? op->next : NULL;
   }
   return 0;

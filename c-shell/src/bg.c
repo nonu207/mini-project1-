@@ -2,35 +2,44 @@
 
 extern char **environ;
 
-/* ── Background job table ──────────────────────────────────────────── */
-/* MAX_BG_JOBS / MAX_PROCS_PER_JOB and the BgJob/BgProc shapes live in   */
-/* bg.h, because activities.c needs them too.                            */
-
-/* Dense array: indices [0, n_jobs) are live, in launch order.  Keeping it
-   dense is what makes "oldest first" free for activities -- with the old
-   scan-for-a-free-slot scheme, slot order diverged from launch order as
-   soon as any job finished. */
+/* The background job table. MAX_BG_JOBS, MAX_JOB_PROCS and the BgJob
+ * and BgProc shapes are defined in bg.h, since activities.c needs them
+ * too.
+ *
+ * The array is kept dense: indices 0 through n_jobs are always the
+ * live jobs, in launch order. That ordering is what lets activities
+ * list jobs oldest first for free. An earlier scheme that scanned for
+ * a free slot let the slot order drift away from launch order as soon
+ * as any job finished. */
 static BgJob bg_jobs[MAX_BG_JOBS];
-static int   n_jobs          = 0;   /* live jobs */
-static int   next_job_number = 0;   /* monotonic; never decremented */
+static int   n_jobs          = 0;
+static int   next_job_number = 0;
 
-/* ── SIGCHLD reaping ───────────────────────────────────────────────── */
-/* Spec: the SIGCHLD handler itself reaps terminated background          */
-/* processes with waitpid() and WNOHANG.  It must never reap a            */
-/* foreground child -- fg_wait, resume fg and snoop wait on those by pid  */
-/* -- so it only waits on the pids in `watched`: processes of tracked     */
-/* jobs that nothing else is waiting on.  printf is not async-signal-     */
-/* safe, so the handler only queues (pid, status); check_bg_jobs reports  */
-/* them from main context.  The job table is still touched only there.    */
-/* Stops and continues are queued too (the pid stays watched), so a job's  */
-/* Stopped/Running state follows the kernel however it was signalled.      */
-/*                                                                          */
-/* No SA_RESTART: the signal also interrupts fgets in main with EINTR,     */
-/* which is what lets a completion be reported while waiting for input.    */
+/* SIGCHLD reaping.
+ *
+ * The spec requires the SIGCHLD handler itself to reap terminated
+ * background processes with waitpid and WNOHANG. It must never reap a
+ * foreground child, since fg_wait, resume fg and snoop each wait on
+ * those processes by pid themselves, so the handler only waits on the
+ * pids in the watched array: the processes of tracked jobs that
+ * nothing else is currently waiting on.
+ *
+ * printf is not safe to call from a signal handler, so the handler
+ * only records each (pid, status) pair into a queue; check_bg_jobs
+ * reports them later from ordinary program context, which is also the
+ * only place the job table itself is touched.
+ *
+ * Stops and continues are queued the same way, with the pid staying
+ * watched afterward, so a job's Stopped or Running state always
+ * follows however the kernel actually signalled it.
+ *
+ * The handler is installed without SA_RESTART, since it also needs to
+ * interrupt a blocking fgets in main with EINTR; that is what lets a
+ * completion be reported while the shell is waiting for input. */
 #define MAX_WATCH (MAX_BG_JOBS * MAX_JOB_PROCS)
 
-static volatile pid_t        watched[MAX_WATCH];  /* 0 marks a free slot */
-static volatile sig_atomic_t watch_hi = 0;         /* in use: [0, watch_hi) */
+static volatile pid_t        watched[MAX_WATCH];
+static volatile sig_atomic_t watch_hi = 0;
 
 static volatile pid_t        reaped_pid[MAX_WATCH];
 static volatile int          reaped_status[MAX_WATCH];
@@ -38,15 +47,16 @@ static volatile sig_atomic_t reaped_n = 0;
 
 static void sigchld_handler(int sig) {
   (void)sig;
-  int saved_errno = errno;  /* don't clobber errno under main's feet */
+  int saved_errno = errno;
 
   for (int i = 0; i < watch_hi && reaped_n < MAX_WATCH; i++) {
     pid_t pid = watched[i];
     if (pid <= 0)
       continue;
     int status;
-    /* WNOHANG: never block.  WUNTRACED/WCONTINUED: also learn about
-       stops and continues; only an exit ends the watch. */
+    /* WNOHANG means this call never blocks. WUNTRACED and WCONTINUED
+     * mean stops and continues are reported too; only an actual exit
+     * ends the watch on this pid. */
     if (waitpid(pid, &status, WNOHANG | WUNTRACED | WCONTINUED) == pid) {
       if (!WIFSTOPPED(status) && !WIFCONTINUED(status))
         watched[i] = 0;
@@ -59,8 +69,8 @@ static void sigchld_handler(int sig) {
   errno = saved_errno;
 }
 
-/* Keep the handler out while main context edits the watch list or
-   drains the queue. */
+/* Blocks SIGCHLD so ordinary program context can safely edit the watch
+ * list or drain the queue without the handler running in the middle. */
 static void block_sigchld(sigset_t *old) {
   sigset_t set;
   sigemptyset(&set);
@@ -72,6 +82,8 @@ static void restore_sigmask(const sigset_t *old) {
   sigprocmask(SIG_SETMASK, old, NULL);
 }
 
+/* Adds a pid to the set the SIGCHLD handler reaps. Does nothing if the
+ * pid is already watched. */
 void bg_watch_pid(pid_t pid) {
   if (pid <= 0)
     return;
@@ -80,7 +92,7 @@ void bg_watch_pid(pid_t pid) {
 
   int slot = -1;
   for (int i = 0; i < watch_hi; i++) {
-    if (watched[i] == pid) {        /* already watched */
+    if (watched[i] == pid) {
       restore_sigmask(&old);
       return;
     }
@@ -89,14 +101,17 @@ void bg_watch_pid(pid_t pid) {
   }
   if (slot < 0 && watch_hi < MAX_WATCH)
     slot = watch_hi++;
-  /* A full list leaves the pid unwatched; check_bg_jobs's sweep still
-     reaps it from main context. */
+  /* If the list is completely full the pid simply goes unwatched here;
+   * check_bg_jobs's own sweep will still reap it eventually. */
   if (slot >= 0)
     watched[slot] = pid;
 
   restore_sigmask(&old);
 }
 
+/* Removes a pid from the set the SIGCHLD handler reaps, so that code
+ * elsewhere can safely wait on it directly. Returns 1 if the pid was
+ * being watched, 0 otherwise. */
 int bg_unwatch_pid(pid_t pid) {
   sigset_t old;
   block_sigchld(&old);
@@ -115,23 +130,23 @@ int bg_unwatch_pid(pid_t pid) {
   return was_watched;
 }
 
-/* ------------------------------------------------------------------ */
-/* hangup_handler: the shell is being terminated by SIGHUP or SIGTERM.  */
-/*                                                                      */
-/* Spec: whenever the shell exits while jobs exist ("via Ctrl-D or      */
-/* otherwise") it sends SIGHUP to every tracked job and does not wait.  */
-/* The job table is not safe to read here, but the watch list is, and   */
-/* it holds every process of every tracked job (the only exception is a */
-/* job that resume fg or snoop is waiting on, which is in the           */
-/* foreground).  SIGCONT follows so a stopped process acts on the       */
-/* hangup.  Then the shell dies of the original signal, as it would     */
-/* have with no handler installed.                                      */
-/* ------------------------------------------------------------------ */
+/* Handles the shell being terminated by SIGHUP or SIGTERM.
+ *
+ * The spec requires that whenever the shell exits while jobs still
+ * exist, whether through Ctrl-D or otherwise, every tracked job
+ * receives SIGHUP and the shell does not wait for them. The job table
+ * itself is not safe to read from a signal handler, but the watch list
+ * is, and it holds every process of every tracked job, with the only
+ * exception being a job that resume fg or snoop is currently waiting
+ * on, which is in the foreground rather than being watched. SIGCONT is
+ * sent as well, so a stopped process can actually act on the hangup.
+ * Afterward the shell dies of the original signal, exactly as it would
+ * have if no handler were installed at all. */
 static pid_t shell_pid = 0;
 
 static void hangup_handler(int sig) {
-  /* A forked built-in or helper inherits this handler until it execs;
-     it must not hang up the shell's jobs. */
+  /* A forked builtin or helper process inherits this handler until it
+   * execs, and it must never hang up the shell's own jobs. */
   if (getpid() == shell_pid) {
     for (int i = 0; i < watch_hi; i++) {
       pid_t pid = watched[i];
@@ -142,11 +157,13 @@ static void hangup_handler(int sig) {
     }
   }
   signal(sig, SIG_DFL);
-  raise(sig);  /* delivered as soon as this handler returns */
+  raise(sig);
 }
 
-/* ── Public API ────────────────────────────────────────────────────── */
-
+/* Initializes the background job subsystem: clears the job table and
+ * the watch and reap queues, and installs the SIGCHLD handler along
+ * with the SIGHUP and SIGTERM handlers that hang up tracked jobs on
+ * exit. */
 void init_bg(void) {
   memset(bg_jobs, 0, sizeof(bg_jobs));
   n_jobs = 0;
@@ -157,21 +174,21 @@ void init_bg(void) {
   struct sigaction sa;
   sa.sa_handler = sigchld_handler;
   sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;  /* no SA_NOCLDSTOP: stops and continues raise SIGCHLD */
+  sa.sa_flags = 0;
   sigaction(SIGCHLD, &sa, NULL);
 
-  /* Exiting by signal must hang up the jobs too (see hangup_handler). */
   shell_pid = getpid();
   struct sigaction hs;
   hs.sa_handler = hangup_handler;
   sigemptyset(&hs.sa_mask);
-  sigaddset(&hs.sa_mask, SIGCHLD);  /* keep the watch list still meanwhile */
+  sigaddset(&hs.sa_mask, SIGCHLD);
   hs.sa_flags = 0;
   sigaction(SIGHUP, &hs, NULL);
   sigaction(SIGTERM, &hs, NULL);
 }
 
-/* A job is Stopped while any of its processes is. */
+/* Keeps a job's overall stopped flag in sync with its processes: a job
+ * is considered stopped while any one of its processes is. */
 static void sync_job_stopped(BgJob *j) {
   j->stopped = 0;
   for (int k = 0; k < j->nprocs; k++)
@@ -179,8 +196,9 @@ static void sync_job_stopped(BgJob *j) {
       j->stopped = 1;
 }
 
-/* Append a job to the table and fill it in.  Shared by the background
-   and the Ctrl-Z paths, which differ only in what they print. */
+/* Appends a new job to the table and fills in its fields. Shared by
+ * the background launch path and the Ctrl-Z stop path, which differ
+ * only in what they print afterward. */
 static BgJob *add_job(pid_t pgid, const pid_t *pids,
                       char (*names)[BG_NAME_MAX], int n,
                       const char *cmdline) {
@@ -191,7 +209,7 @@ static BgJob *add_job(pid_t pgid, const pid_t *pids,
     return NULL;
   }
   if (n > MAX_JOB_PROCS)
-    n = MAX_JOB_PROCS;  /* extra stages still run, just untracked */
+    n = MAX_JOB_PROCS;
 
   BgJob *j = &bg_jobs[n_jobs++];
   memset(j, 0, sizeof(*j));
@@ -208,45 +226,48 @@ static BgJob *add_job(pid_t pgid, const pid_t *pids,
   strncpy(j->lead_name, names[0], BG_NAME_MAX - 1);
   j->lead_name[BG_NAME_MAX - 1] = '\0';
 
-  /* Fall back to the bare command name if no command line was captured. */
   const char *cl = (cmdline != NULL && cmdline[0] != '\0') ? cmdline
                                                            : j->lead_name;
   strncpy(j->cmdline, cl, BG_CMD_MAX - 1);
   j->cmdline[BG_CMD_MAX - 1] = '\0';
 
-  /* From now on the SIGCHLD handler reaps these processes. */
+  /* From this point on the SIGCHLD handler is responsible for reaping
+   * these processes. */
   for (int i = 0; i < n; i++)
     bg_watch_pid(pids[i]);
   return j;
 }
 
+/* Registers a newly launched background job and prints its job number
+ * and process id, as required, before any output the job itself
+ * produces. For a pipeline the pid printed is the first stage's. */
 void register_bg_group(pid_t pgid, const pid_t *pids,
                        char (*names)[BG_NAME_MAX], int n,
                        const char *cmdline) {
   BgJob *j = add_job(pgid, pids, names, n, cmdline);
   if (j == NULL)
     return;
-  /* Spec: print "[job_number] process_id" to stdout, before any output
-     the command produces.  For a pipeline that pid is the first stage. */
   printf("[%d] %d\n", j->job_number, (int)j->lead_pid);
   fflush(stdout);
 }
 
+/* Registers a foreground job that has just been stopped by Ctrl-Z, and
+ * prints the required stopped-job line. fg_wait passes only the
+ * processes that actually stopped. */
 void register_stopped_job(pid_t pgid, const pid_t *pids,
                           char (*names)[BG_NAME_MAX], int n,
                           const char *cmdline) {
   BgJob *j = add_job(pgid, pids, names, n, cmdline);
   if (j == NULL)
     return;
-  /* fg_wait passes only the processes that actually stopped. */
   for (int k = 0; k < j->nprocs; k++)
     j->procs[k].stopped = 1;
   sync_job_stopped(j);
-  /* Spec: "[job_number] + Stopped command" */
   printf("[%d] + Stopped %s\n", j->job_number, j->cmdline);
   fflush(stdout);
 }
 
+/* Reports whether any tracked job is currently stopped. */
 int bg_has_stopped(void) {
   for (int i = 0; i < n_jobs; i++)
     if (bg_jobs[i].stopped)
@@ -254,21 +275,24 @@ int bg_has_stopped(void) {
   return 0;
 }
 
+/* Sends SIGHUP to every tracked job's process group on shell exit, and
+ * does not wait for any of them to terminate. A stopped process cannot
+ * act on SIGHUP until it is running again, so SIGCONT is sent
+ * afterward to wake it; otherwise the hangup would never actually take
+ * effect and the job would outlive the shell. */
 void bg_hangup_all(void) {
   for (int i = 0; i < n_jobs; i++) {
     if (bg_jobs[i].nprocs <= 0)
       continue;
-    /* Negative pid == "the whole process group". */
     kill(-bg_jobs[i].pgid, SIGHUP);
-    /* A stopped process cannot act on SIGHUP until it runs again, so
-       wake it -- otherwise the hangup would never take effect and the
-       job would outlive the shell. */
     if (bg_jobs[i].stopped)
       kill(-bg_jobs[i].pgid, SIGCONT);
   }
-  /* Spec: do NOT wait for these processes to terminate. */
 }
 
+/* Registers a single standalone background command. A standalone
+ * command forms a process group of one, and setpgid already made its
+ * pgid equal to its own pid. */
 void register_bg_job(pid_t pid, const char *name, const char *cmdline) {
   pid_t pids[1] = { pid };
   char  names[1][BG_NAME_MAX];
@@ -278,13 +302,14 @@ void register_bg_job(pid_t pid, const char *name, const char *cmdline) {
     strncpy(names[0], name, BG_NAME_MAX - 1);
     names[0][BG_NAME_MAX - 1] = '\0';
   }
-  /* A standalone command is a process group of one, and setpgid() made
-     its pgid equal to its own pid. */
   register_bg_group(pid, pids, names, 1, cmdline);
 }
 
+/* Records that a tracked process has exited, however it was reaped,
+ * removes it from its job, and if that was the job's last process,
+ * announces the job's completion and drops it from the table. Returns
+ * 1 if a completion message was printed, 0 otherwise. */
 int bg_child_exited(pid_t pid, int status) {
-  /* The pid is gone, however it was reaped. */
   bg_unwatch_pid(pid);
 
   for (int i = 0; i < n_jobs; i++) {
@@ -300,27 +325,24 @@ int bg_child_exited(pid_t pid, int status) {
     if (found < 0)
       continue;
 
-    /* Remember the lead's verdict: it identifies the whole job, and it
-       may exit long before the last stage does. */
+    /* The lead process's own exit status identifies the whole job, and
+     * it may exit long before the last stage of a pipeline does. */
     if (pid == j->lead_pid) {
       j->lead_status = status;
       j->lead_reaped = 1;
     }
     j->last_status = status;
 
-    /* Drop just this process, keeping the rest in pipeline order. */
     for (int k = found; k < j->nprocs - 1; k++)
       j->procs[k] = j->procs[k + 1];
     j->nprocs--;
 
-    /* The job retires only once every process is gone. */
     if (j->nprocs == 0) {
       int st = j->lead_reaped ? j->lead_status : j->last_status;
-      /* Spec: print to stdout (same stream as the prompt and [N] pid).
-         Format: "<name> with pid <pid> exited normally"   (WIFEXITED)
-                 "<name> with pid <pid> exited abnormally" (WIFSIGNALED)
-         Note: NO trailing period — the spec examples have none.
-         The name and pid are the lead's, so one line per job. */
+      /* Printed to stdout, the same stream as the prompt and the
+       * job-number line, with no trailing period, matching the spec's
+       * examples. The name and pid used are always the lead's, so
+       * exactly one line is printed per job. */
       if (WIFEXITED(st)) {
         printf("%s with pid %d exited normally\n",
                j->lead_name, (int)j->lead_pid);
@@ -330,22 +352,20 @@ int bg_child_exited(pid_t pid, int status) {
       }
       fflush(stdout);
 
-      for (int m = i; m < n_jobs - 1; m++)  /* keep the array dense */
+      for (int m = i; m < n_jobs - 1; m++)
         bg_jobs[m] = bg_jobs[m + 1];
       n_jobs--;
       return 1;
     }
-    sync_job_stopped(j);  /* the stopped process may be the one that left */
-    return 0;  /* pids are unique across jobs */
+    sync_job_stopped(j);
+    return 0;
   }
   return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* record_status: apply one wait status of a tracked process.          */
-/* A stop or continue updates that process's state; anything else is   */
-/* an exit.  Returns 1 if a completion message was printed.            */
-/* ------------------------------------------------------------------ */
+/* Applies one wait status collected for a tracked process. A stop or a
+ * continue updates that process's own state; anything else means the
+ * process has exited. Returns 1 if a completion message was printed. */
 static int record_status(pid_t pid, int status) {
   if (!WIFSTOPPED(status) && !WIFCONTINUED(status))
     return bg_child_exited(pid, status);
@@ -360,14 +380,17 @@ static int record_status(pid_t pid, int status) {
       }
     }
   }
-  return 0;  /* not ours (e.g. a redirection helper) */
+  return 0;
 }
 
+/* Drains everything the SIGCHLD handler has collected and reports it,
+ * then sweeps up anything the handler was not watching. Returns how
+ * many completion messages were printed. */
 int check_bg_jobs(void) {
   int reported = 0;
 
-  /* 1. Report what the SIGCHLD handler has reaped.  Copy the queue out
-        with SIGCHLD blocked so the handler cannot append mid-copy. */
+  /* The queue is copied out with SIGCHLD blocked, so the handler
+   * cannot append to it in the middle of the copy. */
   static pid_t pids[MAX_WATCH];
   static int   statuses[MAX_WATCH];
   sigset_t old;
@@ -383,11 +406,12 @@ int check_bg_jobs(void) {
   for (int i = 0; i < n; i++)
     reported += record_status(pids[i], statuses[i]);
 
-  /* 2. Sweep up children the handler does not watch: the feeder/tee
-        helpers of background redirections, and a job that exited before
-        its pid was watched (its SIGCHLD came too early to match).  This
-        runs only from main context with no foreground wait in progress,
-        so it cannot take a foreground child. */
+  /* This second sweep catches children the handler was not watching:
+   * the feeder and tee helper processes used for background
+   * redirections, and a job whose SIGCHLD arrived before its pid was
+   * added to the watch list. It only runs from ordinary program
+   * context with no foreground wait in progress, so it can never take
+   * a foreground child. */
   int status;
   pid_t pid;
   while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED)) > 0)
@@ -395,20 +419,22 @@ int check_bg_jobs(void) {
   return reported;
 }
 
-/* ── Enumeration for activities (different translation unit) ────────── */
-
+/* Returns the number of live tracked jobs, for activities to iterate
+ * over. */
 int bg_live_count(void) {
   return n_jobs;
 }
 
+/* Returns the job at a given index, in launch order, or NULL if the
+ * index is out of range. */
 const BgJob *bg_job_at(int idx) {
   if (idx < 0 || idx >= n_jobs)
     return NULL;
   return &bg_jobs[idx];
 }
 
-/* ── Lookup and mutation, for resume ──────────────────────────────── */
-
+/* Finds a job by its job number, returning a mutable pointer for
+ * internal use. */
 static BgJob *find_mutable(int job_number) {
   for (int i = 0; i < n_jobs; i++)
     if (bg_jobs[i].job_number == job_number)
@@ -416,10 +442,12 @@ static BgJob *find_mutable(int job_number) {
   return NULL;
 }
 
+/* Finds a job by its job number, for lookups outside this file. */
 const BgJob *bg_find_job(int job_number) {
   return find_mutable(job_number);
 }
 
+/* Marks every process in a job as running again. */
 void bg_set_running(int job_number) {
   BgJob *j = find_mutable(job_number);
   if (j == NULL)
@@ -429,6 +457,11 @@ void bg_set_running(int job_number) {
   sync_job_stopped(j);
 }
 
+/* Marks a job as stopped again, keeping only the processes in pids
+ * as still part of it; the rest are assumed to have already exited.
+ * Since resume fg stops watching a job's processes while it waits on
+ * them directly, any that stop again are handed back to the SIGCHLD
+ * handler here. */
 void bg_set_stopped(int job_number, const pid_t *pids, int n) {
   BgJob *j = find_mutable(job_number);
   if (j == NULL)
@@ -436,7 +469,6 @@ void bg_set_stopped(int job_number, const pid_t *pids, int n) {
   if (n > MAX_JOB_PROCS)
     n = MAX_JOB_PROCS;
 
-  /* Keep the stored name for each surviving pid; the rest have exited. */
   BgProc kept[MAX_JOB_PROCS];
   int kn = 0;
   for (int i = 0; i < n; i++) {
@@ -454,37 +486,39 @@ void bg_set_stopped(int job_number, const pid_t *pids, int n) {
   j->nprocs = kn;
   sync_job_stopped(j);
 
-  /* resume fg stops watching a job while it waits on it; hand the
-     processes that stopped again back to the SIGCHLD handler. */
   for (int i = 0; i < kn; i++)
     bg_watch_pid(j->procs[i].pid);
 }
 
+/* Removes a job from the table without printing anything, used when a
+ * resumed foreground job finishes, or when a timed-out job has been
+ * killed. */
 void bg_remove_job(int job_number) {
   for (int i = 0; i < n_jobs; i++) {
     if (bg_jobs[i].job_number != job_number)
       continue;
     for (int k = 0; k < bg_jobs[i].nprocs; k++)
       bg_unwatch_pid(bg_jobs[i].procs[k].pid);
-    for (int m = i; m < n_jobs - 1; m++)   /* keep the array dense */
+    for (int m = i; m < n_jobs - 1; m++)
       bg_jobs[m] = bg_jobs[m + 1];
     n_jobs--;
     return;
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* bg_child_setup: prepare a background child (call after setpgid).    */
-/*                                                                      */
-/* Spec: a background job must not have terminal input.  On a terminal */
-/* process groups enforce that: the job's group is never the terminal's */
-/* foreground group, so a read makes the kernel stop it with SIGTTIN    */
-/* and activities shows it Stopped (the E1 "cat | sort &" example).     */
-/* The shell ignores SIGTTIN/SIGTTOU and ignored signals survive        */
-/* execve, so restore the defaults -- otherwise the read fails with EIO */
-/* and the job just exits.  Without a terminal nothing stops the job    */
-/* from reading the shell's own input, so it gets /dev/null instead.    */
-/* ------------------------------------------------------------------ */
+/* Prepares a background child process, called right after setpgid.
+ *
+ * A background job must not have terminal input. On a real terminal,
+ * process groups already enforce that on their own, since the job's
+ * group is never the terminal's foreground group, so a read from the
+ * terminal makes the kernel stop the job with SIGTTIN, which is the
+ * behaviour shown by the spec's own "cat | sort &" example. The shell
+ * itself ignores SIGTTIN and SIGTTOU, and an ignored signal survives
+ * execve, so both are restored to their default action here; otherwise
+ * the read would simply fail with an error and the job would exit
+ * instead of stopping. Without a terminal at all, nothing else would
+ * stop the job from reading the shell's own input, so its stdin is
+ * replaced with /dev/null in that case. */
 void bg_child_setup(void) {
   signal(SIGTTIN, SIG_DFL);
   signal(SIGTTOU, SIG_DFL);
@@ -498,10 +532,9 @@ void bg_child_setup(void) {
   }
 }
 
-/* ── Extract argv up to TOKEN_OP_AMP (for background commands).       */
-/* Skips redirection operators (< > >>) and their targets. Caller      */
-/* must free().                                                        */
-/* ------------------------------------------------------------------- */
+/* Builds a NULL-terminated argv array from a background command
+ * group's tokens, stopping at the ampersand, and skipping redirection
+ * operators and their targets. The caller must free the result. */
 static char **extract_bg_argv(Token *start, int *out_argc) {
   int count = 0;
   int skip_next = 0;
@@ -545,6 +578,8 @@ static char **extract_bg_argv(Token *start, int *out_argc) {
   return argv;
 }
 
+/* Runs one background command group, either a pipeline or a single
+ * command, without waiting for it to finish. */
 int run_bg_group(Token *start, HopEntry *db, int *db_size) {
   (void)db;
   (void)db_size;
@@ -579,10 +614,12 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
     return 0;
   }
 
-  /* Decide builtin-ness BEFORE resolving a path: a builtin has no
-     executable on disk, so resolving first made "peek &", "reveal &",
-     "locate &" and "hop &" all fail with "command not found".  This
-     ordering matches execute_pipeline / execute_pipeline_bg. */
+  /* Whether the command is a builtin is decided before trying to
+   * resolve it as an executable, since a builtin has no file on disk
+   * to find; resolving first would make "peek &", "reveal &",
+   * "locate &" and "hop &" all incorrectly fail with command not
+   * found. This matches the ordering used in execute_pipeline and
+   * execute_pipeline_bg. */
   int is_builtin = (strcmp(argv[0], "peek") == 0 ||
                     strcmp(argv[0], "reveal") == 0 ||
                     strcmp(argv[0], "locate") == 0 ||
@@ -613,19 +650,20 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
   }
 
   if (pid == 0) {
-    /* Spec #12: a background job must not be tied to the terminal.
-       Terminal-generated signals (^C -> SIGINT, ^Z -> SIGTSTP) are sent
-       to the FOREGROUND process group, so give this job a group of its
-       own; otherwise ^C during a later foreground command kills it too. */
+    /* A background job must not be tied to the terminal. Terminal-
+     * generated signals such as Ctrl-C and Ctrl-Z are sent to the
+     * foreground process group, so this job is given a group of its
+     * own; otherwise a later foreground command's Ctrl-C would kill it
+     * too. */
     setpgid(0, 0);
     bg_child_setup();
 
     SavedFds saved;
     if (apply_redirections(start, &saved) < 0)
       _exit(1);
-    /* The child never restores its stdin/stdout, so drop the backup
-       copies; otherwise every background program inherits them as
-       stray descriptors 3 and 4. */
+    /* This child never restores its own stdin and stdout, so the
+     * backup copies are simply closed here; otherwise every background
+     * program would inherit them as stray descriptors 3 and 4. */
     close(saved.saved_stdin);
     close(saved.saved_stdout);
 
@@ -647,8 +685,9 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
       } else if (strcmp(argv[0], "snoop") == 0) {
         snoop(argc, argv);
       } else if (strcmp(argv[0], "hop") == 0) {
-        /* Load a fresh copy of the db; the child's chdir does not
-           affect the parent shell's working directory anyway.      */
+        /* A fresh copy of the frecency database is loaded here, since
+         * this child's own chdir calls do not affect the parent
+         * shell's working directory anyway. */
         HopEntry local_db[MAX_HOP_ENTRIES];
         int local_sz = 0;
         load_hop_db(local_db, &local_sz);
@@ -663,8 +702,9 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
     _exit(1);
   }
 
-  /* Set the group from the parent as well: whichever side runs first
-     wins, so the job is never briefly in the shell's group. */
+  /* The process group is set from the parent side too, so whichever of
+   * parent and child runs first, the group is set the same way, and
+   * the job is never briefly left in the shell's own group. */
   setpgid(pid, pid);
 
   char cmdline[BG_CMD_MAX];

@@ -6,8 +6,8 @@
 
 #include "syscall_table.h"
 
-/* One summary row.  `order` is the index of the syscall's first call,
-   which is the tie-break when two rows have the same count. */
+/* One summary row for a syscall. order is the index of its first call,
+ * used to break ties when two rows have the same call count. */
 typedef struct {
   long      nr;
   long      calls;
@@ -24,8 +24,9 @@ typedef struct {
 /* How a trace ended. */
 enum { TRACE_EXITED, TRACE_DETACHED, TRACE_FAILED };
 
-/* Set by Ctrl-C while attached with -p.  The handler is installed without
-   SA_RESTART so the blocking waitpid() returns EINTR and sees it. */
+/* Set when Ctrl-C arrives while attached with snoop -p. The handler is
+ * installed without SA_RESTART, so the blocking waitpid it interrupts
+ * returns with EINTR and the flag can be checked. */
 static volatile sig_atomic_t snoop_interrupted = 0;
 
 static void snoop_sigint(int sig) {
@@ -33,11 +34,8 @@ static void snoop_sigint(int sig) {
   snoop_interrupted = 1;
 }
 
-/* ------------------------------------------------------------------ */
-/* Statistics                                                          */
-/* ------------------------------------------------------------------ */
-
-/* The row for `nr`, created on first sight.  NULL only if out of memory. */
+/* Returns the row for a syscall number, creating it on first sight.
+ * Returns NULL only if memory could not be allocated. */
 static SyscallStat *stat_row(StatTable *t, long nr) {
   for (int i = 0; i < t->n; i++)
     if (t->rows[i].nr == nr)
@@ -55,11 +53,13 @@ static SyscallStat *stat_row(StatTable *t, long nr) {
   r->nr    = nr;
   r->calls = 0;
   r->ns    = 0;
-  r->order = t->n;                  /* rows are created in first-call order */
+  r->order = t->n;
   t->n++;
   return r;
 }
 
+/* Looks up a syscall's name by number, falling back to a generated
+ * "syscall_N" name if it is not in the table. */
 static const char *syscall_name(long nr, char *buf, size_t size) {
   size_t count = sizeof(syscall_table) / sizeof(syscall_table[0]);
   for (size_t i = 0; i < count; i++)
@@ -69,7 +69,8 @@ static const char *syscall_name(long nr, char *buf, size_t size) {
   return buf;
 }
 
-/* Spec: by call count descending, ties by order of first occurrence. */
+/* Orders rows by call count descending, breaking ties by the order the
+ * syscall was first seen. */
 static int cmp_stat(const void *a, const void *b) {
   const SyscallStat *x = a;
   const SyscallStat *y = b;
@@ -78,12 +79,14 @@ static int cmp_stat(const void *a, const void *b) {
   return x->order - y->order;
 }
 
+/* Prints the syscall summary table. The column widths match the spec,
+ * and a name too long for its column, such as clock_nanosleep, simply
+ * pushes the rest of its own row right while keeping a separating
+ * space, so the header stays fixed and every row still splits cleanly
+ * on whitespace. */
 static void print_summary(StatTable *t) {
   qsort(t->rows, (size_t)t->n, sizeof(*t->rows), cmp_stat);
 
-  /* Columns exactly as in the spec: 14 and 8 wide.  A longer name (e.g.
-     clock_nanosleep) pushes its own row right but keeps a separating
-     space, so the header never changes and rows still split on blanks. */
   char buf[32];
   printf("%-13s %-7s %s\n", "syscall", "calls", "time");
   for (int i = 0; i < t->n; i++) {
@@ -94,29 +97,25 @@ static void print_summary(StatTable *t) {
   fflush(stdout);
 }
 
-/* ------------------------------------------------------------------ */
-/* Tracing                                                             */
-/* ------------------------------------------------------------------ */
-
+/* Returns the elapsed time in nanoseconds between two timestamps. */
 static long long elapsed_ns(const struct timespec *from,
                             const struct timespec *to) {
   return (long long)(to->tv_sec - from->tv_sec) * 1000000000LL +
          (to->tv_nsec - from->tv_nsec);
 }
 
-/* ------------------------------------------------------------------ */
-/* signal_to_inject: what to hand back to a tracee at a non-syscall stop. */
-/*                                                                      */
-/* A signal-delivery-stop must be passed on or the tracee never sees    */
-/* the signal (so ^C would not kill it).  But after PTRACE_ATTACH a     */
-/* group-stop looks the same in the wait status; re-injecting its      */
-/* signal would loop forever.  PTRACE_GETSIGINFO tells them apart: it   */
-/* fails with EINVAL only for a group-stop.                             */
-/* ------------------------------------------------------------------ */
+/* Decides what signal, if any, should be handed back to the tracee at
+ * a stop that is not a syscall stop. A real signal-delivery stop must
+ * be passed on, or the tracee would never actually receive it, which
+ * would mean Ctrl-C could not kill it. After PTRACE_ATTACH, though, a
+ * group stop looks identical in the wait status, and re-injecting its
+ * signal there would loop forever. PTRACE_GETSIGINFO tells the two
+ * apart, since it fails with EINVAL only for a group stop. */
 static int signal_to_inject(pid_t pid, int status) {
   int sig = WSTOPSIG(status);
 
-  /* exec by the tracee (PTRACE_O_TRACEEXEC): an event, not a signal. */
+  /* An exec by the tracee, reported because of PTRACE_O_TRACEEXEC, is
+   * an event rather than a signal and needs nothing injected. */
   if (sig == SIGTRAP && (status >> 16) == PTRACE_EVENT_EXEC)
     return 0;
 
@@ -126,14 +125,12 @@ static int signal_to_inject(pid_t pid, int status) {
   return sig;
 }
 
-/* ------------------------------------------------------------------ */
-/* detach: stop tracing a live process and leave it running.            */
-/*                                                                      */
-/* PTRACE_DETACH needs the tracee in a ptrace-stop, so send SIGSTOP and */
-/* run until that very signal is reported; detaching from there with    */
-/* signal 0 discards it, so the process never actually stops.  If it    */
-/* exits first, *status receives the exit instead.                      */
-/* ------------------------------------------------------------------ */
+/* Stops tracing a live process and lets it continue running normally.
+ * PTRACE_DETACH requires the tracee to be in a ptrace stop, so SIGSTOP
+ * is sent and the loop runs until that exact signal is reported;
+ * detaching from any earlier stop with signal 0 would discard it
+ * instead of actually stopping the process. If the tracee exits before
+ * that happens, its exit status is returned instead. */
 static int detach(pid_t pid, int *status) {
   kill(pid, SIGSTOP);
   for (;;) {
@@ -156,20 +153,22 @@ static int detach(pid_t pid, int *status) {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* trace_loop: step the tracee syscall by syscall until it exits.       */
-/*                                                                      */
-/* With PTRACE_O_TRACESYSGOOD a syscall-stop reports SIGTRAP|0x80, so   */
-/* it can never be confused with a real SIGTRAP.  Whether a stop is an  */
-/* entry or an exit comes from PTRACE_GET_SYSCALL_INFO rather than from  */
-/* toggling a flag, which would desynchronise if a stop were missed.    */
-/*                                                                      */
-/* The call is counted at ENTRY: exit_group and a successful execve     */
-/* never produce a matching exit, yet they did happen.  Time is added   */
-/* at EXIT, so calls that never return contribute 0.000s.               */
-/*                                                                      */
-/* `attached` enables Ctrl-C detaching (for -p).                        */
-/* ------------------------------------------------------------------ */
+/* Steps a traced process syscall by syscall until it exits, counting
+ * each call and timing it.
+ *
+ * With PTRACE_O_TRACESYSGOOD set, a syscall stop is reported as
+ * SIGTRAP with the high bit set, so it can never be confused with a
+ * genuine SIGTRAP. Whether a given stop is a syscall entry or exit
+ * comes from PTRACE_GET_SYSCALL_INFO rather than from toggling a flag
+ * on each stop, since a flag would fall out of sync if a stop were
+ * ever missed.
+ *
+ * A call is counted at its entry, because some calls such as
+ * exit_group, or a successful execve, never produce a matching exit
+ * even though the call did happen. Time is added at the matching exit,
+ * so a call that never returns simply contributes zero time.
+ *
+ * attached enables the Ctrl-C detaching behaviour used by snoop -p. */
 static int trace_loop(pid_t pid, StatTable *t, int attached, int *status) {
   long            pending_nr = -1;
   struct timespec entry_ts   = {0};
@@ -186,7 +185,8 @@ static int trace_loop(pid_t pid, StatTable *t, int attached, int *status) {
       continue;
     }
 
-    /* Timestamp first, so bookkeeping below does not count as the call. */
+    /* The timestamp is taken before any other bookkeeping, so that
+     * bookkeeping is never itself counted as part of the call. */
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
 
@@ -218,8 +218,9 @@ static int trace_loop(pid_t pid, StatTable *t, int attached, int *status) {
     }
 
     if (attached && snoop_interrupted) {
-      /* Already in a ptrace-stop: detach right here, passing on any
-         signal that was about to be delivered. */
+      /* Already sitting in a ptrace stop, so detaching can happen
+       * right here, passing along any signal that was about to be
+       * delivered. */
       ptrace(PTRACE_DETACH, pid, NULL, (void *)(long)inject);
       return TRACE_DETACHED;
     }
@@ -229,9 +230,8 @@ static int trace_loop(pid_t pid, StatTable *t, int attached, int *status) {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* snoop command [args...]                                              */
-/* ------------------------------------------------------------------ */
+/* Implements "snoop command [args...]": runs a new command under
+ * ptrace and prints a syscall summary once it exits. */
 static void snoop_command(int argc, char **argv) {
   char *path = resolve_command(argv[1]);
   if (path == NULL) {
@@ -239,7 +239,8 @@ static void snoop_command(int argc, char **argv) {
     return;
   }
 
-  /* argv[1..] as the command's own NULL-terminated argument vector. */
+  /* argv[1..] becomes the command's own NULL-terminated argument
+   * vector. */
   char **args = calloc((size_t)argc, sizeof(*args));
   if (args == NULL) {
     free(path);
@@ -258,8 +259,9 @@ static void snoop_command(int argc, char **argv) {
   }
 
   if (pid == 0) {
-    /* The shell ignores or handles these; the command must not inherit
-       that (ignored signals survive execve). */
+    /* The shell ignores or specially handles these signals, and an
+     * ignored signal survives execve, so the command's own handling is
+     * restored to the default before it runs. */
     signal(SIGINT,  SIG_DFL);
     signal(SIGTSTP, SIG_DFL);
     signal(SIGTTOU, SIG_DFL);
@@ -273,8 +275,9 @@ static void snoop_command(int argc, char **argv) {
   free(args);
   free(path);
 
-  /* A successful execve stops the child with SIGTRAP before its first
-     instruction.  An exit here means the exec itself failed. */
+  /* A successful execve stops the child with SIGTRAP right before its
+   * first instruction runs. If the child exited instead, the exec
+   * itself must have failed. */
   int status;
   while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
     ;
@@ -283,7 +286,8 @@ static void snoop_command(int argc, char **argv) {
     return;
   }
 
-  /* EXITKILL: if the shell dies, the tracee must not run on untraced. */
+  /* PTRACE_O_EXITKILL ensures the tracee is killed rather than left
+   * running untraced if the shell itself dies. */
   ptrace(PTRACE_SETOPTIONS, pid, NULL,
          (void *)(long)(PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC |
                         PTRACE_O_EXITKILL));
@@ -299,9 +303,8 @@ static void snoop_command(int argc, char **argv) {
   free(t.rows);
 }
 
-/* ------------------------------------------------------------------ */
-/* snoop -p pid                                                        */
-/* ------------------------------------------------------------------ */
+/* Implements "snoop -p pid": attaches to an already running process
+ * and prints a syscall summary once it exits or is detached from. */
 static void snoop_pid(const char *arg) {
   long value = 0;
   for (const char *p = arg; *p != '\0'; p++) {
@@ -318,9 +321,10 @@ static void snoop_pid(const char *arg) {
   }
   pid_t pid = (pid_t)value;
 
-  /* A tracer collects every stop and the exit of its tracee, so if this
-     is one of our background jobs the SIGCHLD handler must not reap it
-     while we trace.  Re-watched below if it is still alive. */
+  /* A tracer receives every stop and the final exit of its tracee, so
+   * if this pid is one of the shell's own background jobs, the
+   * SIGCHLD handler must stop reaping it while it is being traced. It
+   * is watched again below if it turns out to still be alive. */
   int was_watched = bg_unwatch_pid(pid);
 
   if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) < 0) {
@@ -335,25 +339,28 @@ static void snoop_pid(const char *arg) {
     return;
   }
 
-  /* Attaching sends SIGSTOP; wait for that stop before configuring. */
+  /* Attaching sends SIGSTOP, so that stop is waited for before the
+   * tracer configures anything further. */
   int status;
   while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
     ;
   if (!WIFSTOPPED(status)) {
-    /* It exited in the meantime.  If it was one of our jobs, say so. */
+    /* The process exited in the meantime. If it was one of the
+     * shell's own jobs, that is reported now. */
     bg_child_exited(pid, status);
     fprintf(stderr, "snoop: no such process\n");
     return;
   }
 
-  /* No EXITKILL here: the process was not ours to kill. */
+  /* EXITKILL is not set here, since this process was not the shell's
+   * own to kill. */
   ptrace(PTRACE_SETOPTIONS, pid, NULL,
          (void *)(long)(PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC));
 
   struct sigaction sa, old_sa;
   sa.sa_handler = snoop_sigint;
   sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;                  /* no SA_RESTART: we need the EINTR */
+  sa.sa_flags = 0;
   snoop_interrupted = 0;
   sigaction(SIGINT, &sa, &old_sa);
 
@@ -367,15 +374,18 @@ static void snoop_pid(const char *arg) {
   print_summary(&t);
   free(t.rows);
 
-  /* A tracer collects its tracee's exit.  When that tracee is one of the
-     shell's background jobs, check_bg_jobs() will never see it now, so
-     hand the status over or the job would stay listed forever. */
+  /* A tracer is the one to collect its tracee's exit, so if that
+   * tracee was one of the shell's background jobs, check_bg_jobs would
+   * never otherwise see it exit. Its status is handed over here so the
+   * job does not stay listed forever. */
   if (result == TRACE_EXITED)
     bg_child_exited(pid, status);
   else if (was_watched)
-    bg_watch_pid(pid);            /* detached and still running */
+    bg_watch_pid(pid);
 }
 
+/* Implements the snoop command, dispatching to either snoop_pid for
+ * the "-p pid" form or snoop_command for running a new command. */
 void snoop(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr, "snoop: invalid syntax\n");
@@ -394,6 +404,8 @@ void snoop(int argc, char **argv) {
 
 #else /* !__linux__ */
 
+/* snoop relies on ptrace, which is Linux-specific, so on any other
+ * platform it simply reports itself as unsupported. */
 void snoop(int argc, char **argv) {
   (void)argc;
   (void)argv;

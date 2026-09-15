@@ -1,43 +1,41 @@
 #include "shell.h"
 
-/* ------------------------------------------------------------------ */
-/* read_input_line: read a line from stdin.                            */
-/*                                                                      */
-/* The SIGCHLD handler is installed WITHOUT SA_RESTART, so a           */
-/* background process completing interrupts fgets() with EINTR.       */
-/* When that happens we report the completion first, then resume.      */
-/* This keeps background reporting responsive even while the shell     */
-/* is waiting for user input.                                          */
-/* Returns 0 on success, 1 when SIGINT cancelled the line, -1 on EOF.  */
-/* ------------------------------------------------------------------ */
 static volatile sig_atomic_t sigint_received  = 0;
 static volatile sig_atomic_t sigtstp_received = 0;
 
+/* Records that SIGINT arrived. The handler is installed without
+ * SA_RESTART, so it interrupts a blocking fgets with EINTR, which lets
+ * the main loop notice and cancel the current line. */
 static void sigint_handler(int sig) {
   (void)sig;
   sigint_received = 1;
 }
 
-/* Spec: the shell itself must never be stopped by SIGTSTP.  Installing a
-   handler at all is what prevents the default stop; the flag just lets
-   the main loop cancel the current line and redraw the prompt. */
+/* Records that SIGTSTP arrived. Installing a handler at all is what
+ * keeps the shell from being stopped by the default action; the flag
+ * just lets the main loop cancel the current line and redraw the
+ * prompt afterward. */
 static void sigtstp_handler(int sig) {
   (void)sig;
   sigtstp_received = 1;
 }
 
-/* ------------------------------------------------------------------ */
-/* read_input_line: read one line from stdin.                          */
-/*                                                                      */
-/* Returns 0 on success, 1 when SIGINT/SIGTSTP cancelled the line, and  */
-/* -1 on EOF (Ctrl-D) -- but ONLY when the line is empty.               */
-/*                                                                      */
-/* Ctrl-D mid-line does not end the file: the terminal simply flushes   */
-/* what has been typed so far, so fgets returns text with no trailing   */
-/* newline and feof() stays clear.  We keep that text in the buffer and */
-/* loop, which is how the spec's "keep the text and stay alive" falls   */
-/* out naturally.                                                       */
-/* ------------------------------------------------------------------ */
+/* Reads one line of input from stdin. Returns 0 on a complete line, 1
+ * if SIGINT or SIGTSTP cancelled the read, and -1 on end of file, which
+ * only counts when the line read so far is empty.
+ *
+ * Ctrl-D in the middle of a line does not end the file. The terminal
+ * simply flushes what has been typed so far, so fgets returns that text
+ * with no trailing newline and feof stays clear. On a real terminal
+ * that text is kept and the read continues until Enter, which is how
+ * the requirement to keep the text and stay alive is satisfied. When
+ * input is not a terminal, a final line with no trailing newline is
+ * still run as is.
+ *
+ * While waiting, an interrupting SIGCHLD is used to report any
+ * background job that has just finished, before checking whether the
+ * interrupt was actually a Ctrl-C or Ctrl-Z, so a completion is never
+ * swallowed by a signal that arrives at the same moment. */
 static int read_input_line(char *input, size_t size) {
   size_t len = 0;
   input[0] = '\0';
@@ -49,39 +47,32 @@ static int read_input_line(char *input, size_t size) {
       len += strlen(input + len);
 
       if (len > 0 && input[len - 1] == '\n')
-        return 0;                       /* complete line */
+        return 0;
       if (len + 1 >= size)
-        return 0;                       /* buffer full; run what we have */
+        return 0;
       if (feof(stdin)) {
         clearerr(stdin);
         if (len == 0)
           return -1;
-        /* Spec: Ctrl-D on typed text keeps the text and stays alive, so
-           on a terminal read on until Enter.  Only piped input whose last
-           line has no newline runs that line. */
         if (term_is_tty())
           continue;
         return 0;
       }
-      continue;                         /* partial line: keep the text */
+      continue;
     }
 
     if (feof(stdin)) {
       clearerr(stdin);
-      /* Ctrl-D counts as EOF only on an empty line. */
       if (len == 0)
         return -1;
       if (term_is_tty())
-        continue;                       /* keep the typed text (see above) */
+        continue;
       return 0;
     }
 
     if (errno == EINTR) {
       clearerr(stdin);
 
-      /* Spec: report completions as soon as they happen, even while
-         waiting for input.  This must run BEFORE the signal checks, or a
-         ^C arriving around the same time swallows the report. */
       int reported = check_bg_jobs();
 
       if (sigint_received || sigtstp_received) {
@@ -90,7 +81,6 @@ static int read_input_line(char *input, size_t size) {
         return 1;
       }
 
-      /* A report scrolled the prompt away; draw a fresh one. */
       if (reported > 0)
         display_prompt();
       continue;
@@ -100,28 +90,26 @@ static int read_input_line(char *input, size_t size) {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* main                                                                 */
-/* ------------------------------------------------------------------ */
+/* Entry point. Sets up the frecency history, the prompt, background job
+ * tracking, terminal control and signal handling, then runs the
+ * read, tokenize and execute loop until end of file. On exit, every
+ * tracked job is hung up and the frecency history is saved. */
 int main(void) {
   char input[1024];
   TokenList tokens;
 
-  /* Load the frecency history once at startup */
   HopEntry db[MAX_HOP_ENTRIES];
   int db_size = 0;
   load_hop_db(db, &db_size);
 
   init_prompt();
   init_bg();
-  /* Remember our own pid before any fork, for a bare "spy". */
   spy_init();
-  /* Claim the terminal and make SIGTTOU harmless before any job runs. */
   term_init();
 
-  /* Keep the shell alive on Ctrl-C and Ctrl-Z, while allowing the current
-     read to end.  No SA_RESTART: the interrupted fgets is what lets the
-     shell redraw its prompt. */
+  /* SIGINT and SIGTSTP are handled, not ignored, so the shell survives
+   * them but the interrupted read still returns and lets the main loop
+   * redraw the prompt. SA_RESTART is deliberately left off. */
   struct sigaction sa;
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = 0;
@@ -132,20 +120,19 @@ int main(void) {
   sa.sa_handler = sigtstp_handler;
   sigaction(SIGTSTP, &sa, NULL);
 
-  /* Ctrl-D on an empty line warns once while jobs are stopped; a second
-     Ctrl-D with no input in between exits anyway. */
+  /* Ctrl-D on an empty line only warns once while jobs are stopped; a
+   * second Ctrl-D with no other input in between exits anyway. */
   int eof_pending = 0;
 
   while (1) {
     display_prompt();
 
-    /* STEP 1: Read user input (wakes on background completion too) */
     int read_status = read_input_line(input, sizeof(input));
     if (read_status < 0) {
       printf("\n");
-      /* Apply any stop the SIGCHLD handler has queued but not yet
-         reported, so a job stopped from outside (kill -STOP, or a
-         background read of the terminal) also counts as Stopped. */
+      /* Applies any stop the SIGCHLD handler has queued but not yet
+       * reported, so a job stopped from outside, such as kill -STOP or
+       * a background job reading the terminal, also counts here. */
       check_bg_jobs();
       if (!eof_pending && bg_has_stopped()) {
         fprintf(stderr, "cshell: there are stopped jobs\n");
@@ -154,38 +141,33 @@ int main(void) {
       }
       break;
     }
-    /* Any other input clears the "second Ctrl-D exits" arming. */
     eof_pending = 0;
     if (read_status > 0) {
       printf("\n");
       continue;
     }
 
-    /* STEP 2: Strip trailing newline */
     input[strcspn(input, "\n")] = '\0';
 
-    /* STEP 3: Skip empty input */
     if (strlen(input) == 0)
       continue;
 
-    /* STEP 4: Tokenize */
     if (tokenize(input, &tokens) != 0)
       continue;
     if (tokens.count == 0)
       continue;
 
-    /* STEP 5: Validate grammar */
     if (validate_grammar(&tokens) != 0) {
       free_tokens(&tokens);
       continue;
     }
 
-    /* STEP 6: Execute the ;-separated sequence (see seq.c) */
     run_sequence(&tokens, db, &db_size);
 
-    /* A ^C during the foreground command set this flag; consume it here.
-       Left set, the next SIGCHLD-driven EINTR would be misread as a
-       SIGINT and would discard the user's line. */
+    /* A Ctrl-C during the foreground command set this flag. It is
+     * consumed here so that the next SIGCHLD-driven interrupt is not
+     * mistaken for a fresh Ctrl-C, which would otherwise discard the
+     * next line the user types. */
     if (sigint_received || sigtstp_received) {
       sigint_received = sigtstp_received = 0;
       printf("\n");
@@ -193,15 +175,11 @@ int main(void) {
 
     free_tokens(&tokens);
 
-    /* Report background processes that finished during this run */
     check_bg_jobs();
   }
 
-  /* Spec: hang up every tracked job's process group before exiting, and
-     do not wait for them. */
   bg_hangup_all();
 
-  /* Save frecency history on clean exit */
   save_hop_db(db, db_size);
 
   return 0;

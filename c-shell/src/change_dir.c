@@ -1,65 +1,51 @@
 #include "shell.h"
 
-/* ------------------------------------------------------------------ */
-/* Internal state                                                       */
-/* ------------------------------------------------------------------ */
-
-/* Previous working directory (for the "-" case). */
+/* Previous working directory, used for the dash argument to hop. */
 static char prev_path[1024] = "";
 
 const char *get_prev_path(void) { return prev_path; }
 
-/* ------------------------------------------------------------------ */
-/* frecency_score                                                       */
-/* ------------------------------------------------------------------ */
-/* Computes a "frecency" score for a directory entry. The idea is to
- * rank directories by how often and how recently they've been visited.
- * Raw score gets multiplied by a time-based factor:
- *   - visited within the last hour:   4x boost
- *   - visited within the last day:    2x boost
- *   - visited within the last week:   0.5x penalty
- *   - older than a week:              0.25x penalty
- * This way a directory you used 10 times yesterday beats one you used
- * 20 times last month. */
+/* Computes a frecency score for a directory entry, combining how often
+ * and how recently it has been visited. The raw visit count is
+ * multiplied by a time-based factor: a four times boost if visited
+ * within the last hour, a two times boost within the last day, a half
+ * penalty within the last week, and a quarter penalty beyond that. This
+ * way a directory visited ten times yesterday outranks one visited
+ * twenty times a month ago. */
 double frecency_score(HopEntry *e) {
   time_t now = time(NULL);
-  double age = difftime(now, e->last_visit); /* seconds since last visit */
+  double age = difftime(now, e->last_visit);
   double multiplier;
 
   if (age < 3600.0)
-    multiplier = 4.0; /* < 1 hour  */
+    multiplier = 4.0;
   else if (age < 86400.0)
-    multiplier = 2.0; /* < 1 day   */
+    multiplier = 2.0;
   else if (age < 604800.0)
-    multiplier = 0.5; /* < 1 week  */
+    multiplier = 0.5;
   else
-    multiplier = 0.25; /* older     */
+    multiplier = 0.25;
 
   return e->score * multiplier;
 }
 
-/* ------------------------------------------------------------------ */
-/* age_db                                                               */
-/*                                                                      */
-/* Keeps the frecency database from growing unbounded. If the sum of
- * all raw scores exceeds ZO_MAXAGE, we scale everything down so the
- * total becomes ~90% of MAXAGE. Then we drop any entries whose score
- * fell below 1.0. This prevents old, rarely-used directories from
- * clogging up the database forever. */
+/* Keeps the frecency database from growing without bound. If the sum
+ * of every entry's raw score exceeds ZO_MAXAGE, every score is scaled
+ * down so the new total is about ninety percent of ZO_MAXAGE, and any
+ * entry whose score then falls below 1.0 is dropped. This keeps old,
+ * rarely used directories from clogging up the database forever. */
 void age_db(HopEntry *db, int *db_size) {
   double total = 0.0;
   for (int i = 0; i < *db_size; i++)
     total += db[i].score;
 
   if (total <= ZO_MAXAGE)
-    return; /* Nothing to do */
+    return;
 
-  /* k scales the total down to 90 % of MAXAGE */
   double k = total / (0.9 * ZO_MAXAGE);
   for (int i = 0; i < *db_size; i++)
     db[i].score /= k;
 
-  /* Compact: drop entries that fell below 1.0 */
   int write = 0;
   for (int read = 0; read < *db_size; read++) {
     if (db[read].score >= 1.0)
@@ -68,13 +54,10 @@ void age_db(HopEntry *db, int *db_size) {
   *db_size = write;
 }
 
-/* ------------------------------------------------------------------ */
-/* prune_db                                                             */
-/*                                                                      */
-/* Lazily removes entries for directories that no longer exist on
- * disk, but only if they haven't been visited in the last 90 days.
- * This avoids nuking entries for directories that might be on a
- * temporarily-unmounted filesystem or similar. */
+/* Removes entries for directories that no longer exist on disk, but
+ * only once they have not been visited in the last ninety days. This
+ * avoids deleting entries for a directory that might simply be on a
+ * temporarily unmounted filesystem. */
 void prune_db(HopEntry *db, int *db_size) {
   time_t now = time(NULL);
   int write = 0;
@@ -84,26 +67,21 @@ void prune_db(HopEntry *db, int *db_size) {
     int path_exists = (stat(db[read].path, &st) == 0 && S_ISDIR(st.st_mode));
 
     if (path_exists) {
-      db[write++] = db[read]; /* Path still valid — always keep */
+      db[write++] = db[read];
       continue;
     }
 
-    /* Path is gone — only prune if the entry is also old */
     double age = difftime(now, db[read].last_visit);
     if (age <= PRUNE_AGE_SECS)
-      db[write++] = db[read]; /* Recent enough — keep it for now */
-    /* else: gone AND older than 90 days → silently drop */
+      db[write++] = db[read];
   }
 
   *db_size = write;
 }
 
-/* ------------------------------------------------------------------ */
-/* load_hop_db                                                          */
-/* ------------------------------------------------------------------ */
-/* Loads the frecency database from ~/.cshell_hop_db at startup.
- * If the file doesn't exist yet, that's fine — we just start fresh.
- * After loading, we run prune_db to clean up any stale entries. */
+/* Loads the frecency database from the history file at startup. If the
+ * file does not exist yet, the database simply starts empty. After
+ * loading, prune_db removes any stale entries. */
 void load_hop_db(HopEntry *db, int *db_size) {
   *db_size = 0;
 
@@ -116,7 +94,7 @@ void load_hop_db(HopEntry *db, int *db_size) {
 
   FILE *f = fopen(db_path, "rb");
   if (f == NULL)
-    return; /* No history yet — fine */
+    return;
 
   while (*db_size < MAX_HOP_ENTRIES) {
     if (fread(&db[*db_size], sizeof(HopEntry), 1, f) != 1)
@@ -125,16 +103,13 @@ void load_hop_db(HopEntry *db, int *db_size) {
   }
   fclose(f);
 
-  /* Lazily prune stale entries on every load */
   prune_db(db, db_size);
 }
 
-/* ------------------------------------------------------------------ */
-/* save_hop_db                                                          */
-/* ------------------------------------------------------------------ */
-/* Persists the frecency database to ~/.cshell_hop_db on clean exit.
- * We don't sweat it if the write fails — just print a warning and
- * keep going. The database is advisory anyway. */
+/* Persists the frecency database to the history file on a clean exit.
+ * A failure to write is reported but otherwise ignored, since the
+ * database is only advisory and losing it costs nothing but the
+ * ranking history. */
 void save_hop_db(HopEntry *db, int db_size) {
   char *home = getenv("HOME");
   if (home == NULL)
@@ -152,43 +127,36 @@ void save_hop_db(HopEntry *db, int db_size) {
   fclose(f);
 }
 
-/* ------------------------------------------------------------------ */
-/* record_visit                                                         */
-/* ------------------------------------------------------------------ */
 /* Updates the frecency database after a successful hop. If the
- * directory is already in the database, we bump its score and refresh
- * the timestamp. Otherwise we add a new entry (if there's room).
- * Then we run age_db to keep the total score in check. */
+ * directory is already recorded, its score is increased and its
+ * timestamp refreshed; otherwise a new entry is added if there is
+ * room. Either way, age_db is run afterward to keep the total score in
+ * check. */
 void record_visit(HopEntry *db, int *db_size, const char *abs_path) {
-  /* Update existing entry */
   for (int i = 0; i < *db_size; i++) {
     if (strcmp(db[i].path, abs_path) == 0) {
       db[i].score += 1.0;
       db[i].last_visit = time(NULL);
-      age_db(db, db_size); /* Check aging on every update */
+      age_db(db, db_size);
       return;
     }
   }
 
-  /* Insert new entry */
   if (*db_size < MAX_HOP_ENTRIES) {
     strncpy(db[*db_size].path, abs_path, sizeof(db[*db_size].path) - 1);
     db[*db_size].path[sizeof(db[*db_size].path) - 1] = '\0';
     db[*db_size].score = 1.0;
     db[*db_size].last_visit = time(NULL);
     (*db_size)++;
-    age_db(db, db_size); /* Check aging on every insertion */
+    age_db(db, db_size);
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* Internal: chdir helper — saves prev_path and records the visit.     */
-/* Returns 0 on success, -1 on failure.                                */
-/* ------------------------------------------------------------------ */
-/* Wraps chdir() with the bookkeeping we need: save the old directory
- * for the "-" shortcut, resolve the real absolute path (since the
- * argument might be relative), and record the visit in the frecency
- * database. */
+/* Wraps chdir with the bookkeeping hop needs: it saves the current
+ * directory for the dash shortcut, resolves the real absolute path of
+ * the destination since the argument might have been relative, and
+ * records the visit in the frecency database. Returns 0 on success, -1
+ * on failure. */
 static int do_chdir(const char *target, HopEntry *db, int *db_size) {
   char cwd_before[1024];
   if (getcwd(cwd_before, sizeof(cwd_before)) == NULL) {
@@ -199,14 +167,12 @@ static int do_chdir(const char *target, HopEntry *db, int *db_size) {
   if (chdir(target) != 0)
     return -1;
 
-  /* Resolve the real new path (target may have been relative) */
   char cwd_after[1024];
   if (getcwd(cwd_after, sizeof(cwd_after)) == NULL) {
     perror("hop: getcwd");
     return -1;
   }
 
-  /* Save for "-" */
   strncpy(prev_path, cwd_before, sizeof(prev_path) - 1);
   prev_path[sizeof(prev_path) - 1] = '\0';
 
@@ -214,15 +180,12 @@ static int do_chdir(const char *target, HopEntry *db, int *db_size) {
   return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Internal: frecency best-match lookup.                               */
-/* Returns index of best matching entry, or -1 if none.               */
-/* ------------------------------------------------------------------ */
-/* Scans the database for entries whose path contains the query string
- * as a substring. Among those, picks the one with the highest frecency
- * score. This is the "fuzzy jump" feature — type part of a path and
- * hop figures out which directory you probably meant. Entries marked
- * in tried[] were already attempted and failed, so they are skipped. */
+/* Scans the frecency database for entries whose path contains the
+ * query string as a substring, and returns the index of whichever
+ * matching entry has the highest frecency score, or -1 if none match.
+ * This is the fuzzy jump feature, where typing part of a path lets hop
+ * guess which directory was meant. Entries already marked in tried
+ * were attempted and failed, so they are skipped. */
 static int frecency_lookup(const char *query, HopEntry *db, int db_size,
                            const char *tried) {
   int best_idx = -1;
@@ -241,24 +204,18 @@ static int frecency_lookup(const char *query, HopEntry *db, int db_size,
   return best_idx;
 }
 
-/* ------------------------------------------------------------------ */
-/* hop_one: apply a single hop argument (NULL means no argument).      */
-/* ------------------------------------------------------------------ */
-/* Handles five cases:
- *
- * 1. No argument or "~" → jump to the shell's home directory.
- * 2. "." → stay put (no-op).
- * 3. ".." → go to parent (no-op at root).
- * 4. "-" → go to previous directory (no-op if none saved).
- * 5. "name" → try as a direct path first (relative or absolute).
- *    If that fails, fall back to frecency substring match.
- *    If neither works, print "hop: no such directory".
- *
- * Each successful hop updates the frecency database and saves the
- * previous directory for the "-" shortcut. */
+/* Applies a single hop argument, where NULL means no argument was
+ * given. There are five cases: no argument or a tilde goes to the
+ * shell's home directory; a single dot stays in place; a double dot
+ * goes to the parent directory, or does nothing at the filesystem
+ * root; a dash goes to the previous directory, or does nothing if
+ * there is none; and any other name is first tried as a direct
+ * relative or absolute path, and if that fails, as a frecency
+ * substring match. If nothing works, an error is printed. Every
+ * successful hop updates the frecency database and records the
+ * previous directory for the dash shortcut. */
 static void hop_one(const char *arg, HopEntry *db, int *db_size) {
 
-  /* ── Case 1: no argument or "~" → go to shell's home dir ─────── */
   if (arg == NULL || strcmp(arg, "~") == 0) {
     const char *home = get_shell_home();
     if (home == NULL || home[0] == '\0') {
@@ -270,11 +227,9 @@ static void hop_one(const char *arg, HopEntry *db, int *db_size) {
     return;
   }
 
-  /* ── Case 2: "." → stay in place ──────────────────────────────── */
   if (strcmp(arg, ".") == 0)
     return;
 
-  /* ── Case 3: ".." → go to parent (no-op at root) ──────────────── */
   if (strcmp(arg, "..") == 0) {
     char cwd[1024];
     if (getcwd(cwd, sizeof(cwd)) == NULL) {
@@ -282,30 +237,26 @@ static void hop_one(const char *arg, HopEntry *db, int *db_size) {
       return;
     }
     if (strcmp(cwd, "/") == 0)
-      return; /* already at root */
+      return;
     if (do_chdir("..", db, db_size) != 0)
       fprintf(stderr, "hop: no such directory\n");
     return;
   }
 
-  /* ── Case 4: "-" → go to previous directory ───────────────────── */
   if (strcmp(arg, "-") == 0) {
     if (prev_path[0] == '\0')
-      return; /* no previous dir, do nothing */
+      return;
     if (do_chdir(prev_path, db, db_size) != 0)
       fprintf(stderr, "hop: no such directory\n");
     return;
   }
 
-  /* ── Case 5: "name" → direct path, then frecency fallback ─────── */
-
-  /* 5a. Try as a direct relative or absolute path */
   if (do_chdir(arg, db, db_size) == 0)
     return;
 
-  /* 5b. Frecency fallback: best-scoring substring match. If the top
-   * match no longer exists on disk, skip it and try the next best.
-   * A failed do_chdir leaves db untouched, so indices stay valid. */
+  /* If the best-scoring match no longer exists on disk, do_chdir fails
+   * without touching the database, so it is marked tried and the next
+   * best match is tried instead. */
   char tried[MAX_HOP_ENTRIES] = {0};
   int best;
   while ((best = frecency_lookup(arg, db, *db_size, tried)) >= 0) {
@@ -314,16 +265,12 @@ static void hop_one(const char *arg, HopEntry *db, int *db_size) {
     tried[best] = 1;
   }
 
-  /* 5c. Nothing matched */
   fprintf(stderr, "hop: no such directory\n");
 }
 
-/* ------------------------------------------------------------------ */
-/* hop                                                                  */
-/* ------------------------------------------------------------------ */
-/* Implements the hop builtin: with no arguments, go home; otherwise
- * apply each argument in order (e.g. "hop a .. -"). A failing argument
- * prints its error and the remaining arguments still run. */
+/* Implements the hop builtin. With no arguments it goes to the shell's
+ * home directory; otherwise each argument is applied in order, for
+ * example "hop a .. -", so several hops can be chained on one line. */
 void hop(int argc, char **argv, HopEntry *db, int *db_size) {
   if (argc < 2) {
     hop_one(NULL, db, db_size);
