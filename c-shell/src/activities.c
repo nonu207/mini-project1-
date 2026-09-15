@@ -50,21 +50,6 @@ static char proc_state_char(pid_t pid) {
 }
 
 /* ------------------------------------------------------------------ */
-/* proc_state_string: map the state character to what the spec prints.  */
-/* 'T' (stopped) and 't' (tracing stop) are Stopped; R/S/D/Z/I are all  */
-/* Running, and so is the unknown case -- a process still in the job    */
-/* table has already survived check_bg_jobs(), so it is known live and  */
-/* "we cannot prove it is stopped" correctly means Running.  This is    */
-/* also the no-procfs fallback: one branch, no second code path.        */
-/* ------------------------------------------------------------------ */
-static const char *proc_state_string(pid_t pid) {
-  char c = proc_state_char(pid);
-  if (c == 'T' || c == 't')
-    return "Stopped";
-  return "Running";
-}
-
-/* ------------------------------------------------------------------ */
 /* activities — main entry point                                       */
 /* ------------------------------------------------------------------ */
 void activities(int argc, char **argv) {
@@ -96,13 +81,17 @@ void activities(int argc, char **argv) {
          though it could not be reaped here (this happens when
          activities runs in a forked child, which sees a copy-on-write
          snapshot of the table).  Inert where procfs is absent. */
-      if (procfs_available() && proc_state_char(pid) == 0)
+      char c = procfs_available() ? proc_state_char(pid) : 0;
+      if (procfs_available() && c == 0)
         continue;
 
-      /* A job the shell itself suspended is known Stopped without
-         asking procfs -- which is also the only way the state is right
-         on systems with no /proc. */
-      const char *state = j->stopped ? "Stopped" : proc_state_string(pid);
+      /* Each process's own state: /proc when present ('T' stopped, 't'
+         tracing stop; R/S/D/I are Running), otherwise the state the
+         SIGCHLD handler last reported for it.  Never the job-wide flag,
+         which says Stopped if any one process is. */
+      int stopped = (c != 0) ? (c == 'T' || c == 't')
+                             : j->procs[k].stopped;
+      const char *state = stopped ? "Stopped" : "Running";
 
       /* Two-space indent, space-separated; no column alignment. */
       printf("  %d %s %s\n", (int)pid, j->procs[k].command_name, state);

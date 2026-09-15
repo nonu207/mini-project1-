@@ -22,6 +22,8 @@ static int   next_job_number = 0;   /* monotonic; never decremented */
 /* jobs that nothing else is waiting on.  printf is not async-signal-     */
 /* safe, so the handler only queues (pid, status); check_bg_jobs reports  */
 /* them from main context.  The job table is still touched only there.    */
+/* Stops and continues are queued too (the pid stays watched), so a job's  */
+/* Stopped/Running state follows the kernel however it was signalled.      */
 /*                                                                          */
 /* No SA_RESTART: the signal also interrupts fgets in main with EINTR,     */
 /* which is what lets a completion be reported while waiting for input.    */
@@ -43,9 +45,11 @@ static void sigchld_handler(int sig) {
     if (pid <= 0)
       continue;
     int status;
-    /* WNOHANG: never block.  No WUNTRACED: a stopped job stays put. */
-    if (waitpid(pid, &status, WNOHANG) == pid) {
-      watched[i] = 0;
+    /* WNOHANG: never block.  WUNTRACED/WCONTINUED: also learn about
+       stops and continues; only an exit ends the watch. */
+    if (waitpid(pid, &status, WNOHANG | WUNTRACED | WCONTINUED) == pid) {
+      if (!WIFSTOPPED(status) && !WIFCONTINUED(status))
+        watched[i] = 0;
       reaped_pid[reaped_n] = pid;
       reaped_status[reaped_n] = status;
       reaped_n++;
@@ -111,6 +115,36 @@ int bg_unwatch_pid(pid_t pid) {
   return was_watched;
 }
 
+/* ------------------------------------------------------------------ */
+/* hangup_handler: the shell is being terminated by SIGHUP or SIGTERM.  */
+/*                                                                      */
+/* Spec: whenever the shell exits while jobs exist ("via Ctrl-D or      */
+/* otherwise") it sends SIGHUP to every tracked job and does not wait.  */
+/* The job table is not safe to read here, but the watch list is, and   */
+/* it holds every process of every tracked job (the only exception is a */
+/* job that resume fg or snoop is waiting on, which is in the           */
+/* foreground).  SIGCONT follows so a stopped process acts on the       */
+/* hangup.  Then the shell dies of the original signal, as it would     */
+/* have with no handler installed.                                      */
+/* ------------------------------------------------------------------ */
+static pid_t shell_pid = 0;
+
+static void hangup_handler(int sig) {
+  /* A forked built-in or helper inherits this handler until it execs;
+     it must not hang up the shell's jobs. */
+  if (getpid() == shell_pid) {
+    for (int i = 0; i < watch_hi; i++) {
+      pid_t pid = watched[i];
+      if (pid > 0) {
+        kill(pid, SIGHUP);
+        kill(pid, SIGCONT);
+      }
+    }
+  }
+  signal(sig, SIG_DFL);
+  raise(sig);  /* delivered as soon as this handler returns */
+}
+
 /* ── Public API ────────────────────────────────────────────────────── */
 
 void init_bg(void) {
@@ -123,8 +157,26 @@ void init_bg(void) {
   struct sigaction sa;
   sa.sa_handler = sigchld_handler;
   sigemptyset(&sa.sa_mask);
-  sa.sa_flags = SA_NOCLDSTOP;
+  sa.sa_flags = 0;  /* no SA_NOCLDSTOP: stops and continues raise SIGCHLD */
   sigaction(SIGCHLD, &sa, NULL);
+
+  /* Exiting by signal must hang up the jobs too (see hangup_handler). */
+  shell_pid = getpid();
+  struct sigaction hs;
+  hs.sa_handler = hangup_handler;
+  sigemptyset(&hs.sa_mask);
+  sigaddset(&hs.sa_mask, SIGCHLD);  /* keep the watch list still meanwhile */
+  hs.sa_flags = 0;
+  sigaction(SIGHUP, &hs, NULL);
+  sigaction(SIGTERM, &hs, NULL);
+}
+
+/* A job is Stopped while any of its processes is. */
+static void sync_job_stopped(BgJob *j) {
+  j->stopped = 0;
+  for (int k = 0; k < j->nprocs; k++)
+    if (j->procs[k].stopped)
+      j->stopped = 1;
 }
 
 /* Append a job to the table and fill it in.  Shared by the background
@@ -186,7 +238,10 @@ void register_stopped_job(pid_t pgid, const pid_t *pids,
   BgJob *j = add_job(pgid, pids, names, n, cmdline);
   if (j == NULL)
     return;
-  j->stopped = 1;
+  /* fg_wait passes only the processes that actually stopped. */
+  for (int k = 0; k < j->nprocs; k++)
+    j->procs[k].stopped = 1;
+  sync_job_stopped(j);
   /* Spec: "[job_number] + Stopped command" */
   printf("[%d] + Stopped %s\n", j->job_number, j->cmdline);
   fflush(stdout);
@@ -280,9 +335,32 @@ int bg_child_exited(pid_t pid, int status) {
       n_jobs--;
       return 1;
     }
+    sync_job_stopped(j);  /* the stopped process may be the one that left */
     return 0;  /* pids are unique across jobs */
   }
   return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* record_status: apply one wait status of a tracked process.          */
+/* A stop or continue updates that process's state; anything else is   */
+/* an exit.  Returns 1 if a completion message was printed.            */
+/* ------------------------------------------------------------------ */
+static int record_status(pid_t pid, int status) {
+  if (!WIFSTOPPED(status) && !WIFCONTINUED(status))
+    return bg_child_exited(pid, status);
+
+  for (int i = 0; i < n_jobs; i++) {
+    BgJob *j = &bg_jobs[i];
+    for (int k = 0; k < j->nprocs; k++) {
+      if (j->procs[k].pid == pid) {
+        j->procs[k].stopped = WIFSTOPPED(status) ? 1 : 0;
+        sync_job_stopped(j);
+        return 0;
+      }
+    }
+  }
+  return 0;  /* not ours (e.g. a redirection helper) */
 }
 
 int check_bg_jobs(void) {
@@ -303,7 +381,7 @@ int check_bg_jobs(void) {
   restore_sigmask(&old);
 
   for (int i = 0; i < n; i++)
-    reported += bg_child_exited(pids[i], statuses[i]);
+    reported += record_status(pids[i], statuses[i]);
 
   /* 2. Sweep up children the handler does not watch: the feeder/tee
         helpers of background redirections, and a job that exited before
@@ -312,8 +390,8 @@ int check_bg_jobs(void) {
         so it cannot take a foreground child. */
   int status;
   pid_t pid;
-  while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
-    reported += bg_child_exited(pid, status);
+  while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED)) > 0)
+    reported += record_status(pid, status);
   return reported;
 }
 
@@ -344,8 +422,11 @@ const BgJob *bg_find_job(int job_number) {
 
 void bg_set_running(int job_number) {
   BgJob *j = find_mutable(job_number);
-  if (j != NULL)
-    j->stopped = 0;
+  if (j == NULL)
+    return;
+  for (int k = 0; k < j->nprocs; k++)
+    j->procs[k].stopped = 0;
+  sync_job_stopped(j);
 }
 
 void bg_set_stopped(int job_number, const pid_t *pids, int n) {
@@ -366,10 +447,12 @@ void bg_set_stopped(int job_number, const pid_t *pids, int n) {
       }
     }
   }
-  for (int i = 0; i < kn; i++)
+  for (int i = 0; i < kn; i++) {
     j->procs[i] = kept[i];
-  j->nprocs  = kn;
-  j->stopped = 1;
+    j->procs[i].stopped = 1;
+  }
+  j->nprocs = kn;
+  sync_job_stopped(j);
 
   /* resume fg stops watching a job while it waits on it; hand the
      processes that stopped again back to the SIGCHLD handler. */
@@ -387,6 +470,31 @@ void bg_remove_job(int job_number) {
       bg_jobs[m] = bg_jobs[m + 1];
     n_jobs--;
     return;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* bg_child_setup: prepare a background child (call after setpgid).    */
+/*                                                                      */
+/* Spec: a background job must not have terminal input.  On a terminal */
+/* process groups enforce that: the job's group is never the terminal's */
+/* foreground group, so a read makes the kernel stop it with SIGTTIN    */
+/* and activities shows it Stopped (the E1 "cat | sort &" example).     */
+/* The shell ignores SIGTTIN/SIGTTOU and ignored signals survive        */
+/* execve, so restore the defaults -- otherwise the read fails with EIO */
+/* and the job just exits.  Without a terminal nothing stops the job    */
+/* from reading the shell's own input, so it gets /dev/null instead.    */
+/* ------------------------------------------------------------------ */
+void bg_child_setup(void) {
+  signal(SIGTTIN, SIG_DFL);
+  signal(SIGTTOU, SIG_DFL);
+
+  if (!term_is_tty()) {
+    int devnull = open("/dev/null", O_RDONLY);
+    if (devnull >= 0) {
+      dup2(devnull, STDIN_FILENO);
+      close(devnull);
+    }
   }
 }
 
@@ -510,12 +618,7 @@ int run_bg_group(Token *start, HopEntry *db, int *db_size) {
        to the FOREGROUND process group, so give this job a group of its
        own; otherwise ^C during a later foreground command kills it too. */
     setpgid(0, 0);
-
-    int devnull = open("/dev/null", O_RDONLY);
-    if (devnull >= 0) {
-      dup2(devnull, STDIN_FILENO);
-      close(devnull);
-    }
+    bg_child_setup();
 
     SavedFds saved;
     if (apply_redirections(start, &saved) < 0)

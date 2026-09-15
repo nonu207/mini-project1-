@@ -178,6 +178,15 @@ found:
   // that were used before, so this is where we place the new process in queue 0, the highest
   // priority. It is not given its arrival stamp yet, because it is not RUNNABLE yet; that happens in
   // userinit() or kfork() once the process is fully set up.
+  // Scheduler comparison bookkeeping, present under every scheduler. The process arrives now, so
+  // ctime is the current tick; it has not run yet, so first_run_time and etime are both "not yet"
+  // (-1), and no RUNNING or RUNNABLE ticks have accumulated.
+  p->ctime = ticks;
+  p->first_run_time = -1;
+  p->etime = -1;
+  p->rtime = 0;
+  p->wtime = 0;
+
 #ifdef USE_MLFQ
   p->queue = 0;
   // A brand new process has not run yet, so none of its first time slice has been used.
@@ -418,6 +427,16 @@ kexit(int status)
   // Under MLFQ this is the moment the process leaves the queuing system: a ZOMBIE is never RUNNABLE
   // again, so the scheduler will never choose it, and it is not put back into any queue. Its
   // leftover MLFQ fields are cleared later in freeproc().
+  //
+  // This is also the process's completion time, so its comparison bookkeeping is now final: etime
+  // is set here, and ctime/first_run_time/rtime/wtime were already being maintained by allocproc(),
+  // the scheduler and update_times(). With SCHED_STATS on, print all of it now while p is still
+  // valid; freeproc() only runs later, once the parent has reaped this zombie.
+  p->etime = ticks;
+#ifdef SCHED_STATS
+  printk("SCHEDSTAT pid=%d name=%s ctime=%d first_run=%d etime=%d rtime=%d wtime=%d\n", p->pid,
+         p->name, p->ctime, p->first_run_time, p->etime, p->rtime, p->wtime);
+#endif
 
   release(&wait_lock);
 
@@ -472,6 +491,45 @@ kwait(uint64 addr)
 
     // Wait for a child to exit.
     sleep(p, &wait_lock); //DOC: wait-sleep
+  }
+}
+
+// Records the tick a process was first handed the CPU, the moment its response time is measured
+// from. Called right after a scheduler sets a process to RUNNING, with p->lock already held. Only
+// the first call for a process has any effect, because after that first_run_time is no longer -1.
+static void
+note_dispatch(struct proc *p)
+{
+  if (p->first_run_time == -1)
+    p->first_run_time = ticks;
+}
+
+// Scheduler comparison accounting, run once per tick for every process regardless of which
+// scheduler is compiled in, so RR, FCFS and MLFQ are all measured the same way on the same
+// workload. A process accumulates one more tick of rtime while RUNNING and one more tick of wtime
+// while RUNNABLE (xv6's ready-queue state); SLEEPING, ZOMBIE and UNUSED processes accumulate
+// neither, since they are not competing for the CPU. Called from clockintr() in trap.c, which
+// already only runs this once per tick for the whole system (on CPU 0).
+//
+// Under MLFQ with SCHED_STATS on, this is also where each process's current queue is logged, one
+// QLOG line per process per tick, which is the raw data the 2.3.2 timeline plot is built from.
+void
+update_times(void)
+{
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state == RUNNING) {
+      p->rtime++;
+    } else if (p->state == RUNNABLE) {
+      p->wtime++;
+    }
+#if defined(USE_MLFQ) && defined(SCHED_STATS)
+    if (p->state == RUNNING || p->state == RUNNABLE)
+      printk("QLOG tick=%d pid=%d queue=%d\n", ticks, p->pid, p->queue);
+#endif
+    release(&p->lock);
   }
 }
 
@@ -538,11 +596,45 @@ scheduler(void)
         // to release its lock and then reacquire it
         // before jumping back to us.
         best->state = RUNNING;
+        note_dispatch(best);
         c->proc = best;
         swtch(&c->context, &best->context);
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
+        c->proc = 0;
+      }
+      release(&best->lock);
+    }
+#elif defined(USE_FCFS)
+    // FCFS selection. A lower pid means the process was created earlier (see nextpid in
+    // allocproc()), so "earliest arrival" is simply "smallest pid". We scan every process and
+    // remember the RUNNABLE one with the smallest pid, the same two-pass pattern used for MLFQ
+    // above: find the winner while holding only one p->lock at a time, then switch to it.
+    //
+    // Nothing here changes how often a process gives up the CPU: trap.c still calls yield() on
+    // every timer tick for this build, exactly as it does for plain RR. What changes is who gets
+    // picked afterwards. When a process yields it goes back to RUNNABLE, and if it still has the
+    // smallest pid among RUNNABLE processes, this scan picks it again immediately. So in practice
+    // the earliest-arrived process keeps winning every tick and runs to completion, and only once
+    // it exits or sleeps does the next-earliest process get a turn, which is the FCFS behaviour
+    // the scheduler is supposed to have.
+    struct proc *best = 0;
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if (p->state == RUNNABLE && (best == 0 || p->pid < best->pid)) {
+        best = p;
+      }
+      release(&p->lock);
+    }
+    if (best != 0) {
+      found = 1;
+      acquire(&best->lock);
+      if (best->state == RUNNABLE) {
+        best->state = RUNNING;
+        note_dispatch(best);
+        c->proc = best;
+        swtch(&c->context, &best->context);
         c->proc = 0;
       }
       release(&best->lock);
@@ -555,6 +647,7 @@ scheduler(void)
         // to release its lock and then reacquire it
         // before jumping back to us.
         p->state = RUNNING;
+        note_dispatch(p);
         c->proc = p;
         swtch(&c->context, &p->context);
 
@@ -645,6 +738,9 @@ mlfq_tick(void)
   acquire(&p->lock);
   p->ticks_used++;
   if (p->ticks_used >= time_slice[p->queue]) {
+    // Queue 3 is round-robin. A process in queue 3 that uses its whole 16-tick slice cannot go any
+    // lower, so it stays in queue 3, and yield() below puts it at the tail of queue 3. Every other
+    // queue-3 process is now ahead of it, so each of them gets a full turn before it runs again.
     if (p->queue < 3)
       p->queue++;
     p->ticks_used = 0;
@@ -665,6 +761,27 @@ mlfq_tick(void)
       yield();
       return;
     }
+  }
+}
+
+// Priority boost, run every 48 ticks from clockintr() in trap.c. Without it, a steady stream of
+// high-priority processes could stop processes in the lower queues from ever running (starvation).
+// Every process in the system goes back to queue 0 with a fresh time slice: RUNNABLE ones waiting
+// in a queue, RUNNING ones currently on a CPU, and SLEEPING ones, so that they also wake up in
+// queue 0. Only UNUSED slots are skipped, because they are not processes. Arrival stamps are not
+// changed, so the processes keep their existing order relative to each other inside queue 0.
+void
+mlfq_boost(void)
+{
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state != UNUSED) {
+      p->queue = 0;
+      p->ticks_used = 0;
+    }
+    release(&p->lock);
   }
 }
 #endif
@@ -726,6 +843,15 @@ sleep(void *chan, struct spinlock *lk)
   // Go to sleep.
   p->chan = chan;
   p->state = SLEEPING;
+  // Voluntary yield under MLFQ. A process that goes to sleep (waiting for I/O, a pipe, a child, a
+  // timer, ...) is giving up the CPU by itself before its time slice ran out. Because it is now
+  // SLEEPING and not RUNNABLE, it has left the queues and the scheduler cannot pick it. Its queue
+  // number is deliberately left alone, so when it wakes up it goes back into the same queue. The
+  // part of the slice it already used is dropped (ticks_used goes back to 0): that slice ended when
+  // it chose to give up the CPU, and it starts a new full slice for its queue when it runs again.
+#ifdef USE_MLFQ
+  p->ticks_used = 0;
+#endif
 
   sched();
 
@@ -749,9 +875,11 @@ wakeup(void *chan)
       acquire(&p->lock);
       if (p->state == SLEEPING && p->chan == chan) {
         p->state = RUNNABLE;
-        // A sleeping process is not in any queue. When it wakes up it rejoins a queue, so it gets a
-        // fresh stamp that puts it at the end, instead of cutting in front with its old stamp. Its
-        // queue number is not touched here.
+        // The process is RUNNABLE again, so it rejoins the queues. Its queue number was not changed
+        // while it slept, so it goes back into the same queue it was in when it went to sleep (or
+        // queue 0, if a priority boost happened in the meantime). mlfq_enqueue gives it a fresh
+        // stamp, which puts it at the tail of that queue instead of letting it cut in front with its
+        // old stamp.
 #ifdef USE_MLFQ
         mlfq_enqueue(p);
 #endif

@@ -76,16 +76,27 @@ CFLAGS += -fno-builtin-printf -fno-builtin-fprintf -fno-builtin-vprintf
 CFLAGS += -I.
 CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
 
-# Scheduler selection: allows compile-time selection between RR (round-robin) and MLFQ schedulers.
+# Scheduler selection: allows compile-time selection between RR (round-robin), FCFS
+# (first-come-first-served) and MLFQ schedulers.
 # Reason: Different scheduling policies require different data structures and scheduling logic.
 # By setting this at compile time, we avoid runtime overhead and ensure only one scheduler is compiled.
-# Effect: Sets -DUSE_RR (default) or -DUSE_MLFQ flag, which controls conditional compilation in proc.c and proc.h
-ifdef SCHEDULER
-  ifeq ($(SCHEDULER), MLFQ)
-    CFLAGS += -DUSE_MLFQ
-  endif
+# Effect: Sets -DUSE_MLFQ, -DUSE_FCFS or -DUSE_RR (default), which controls conditional compilation
+# in proc.c and proc.h
+ifeq ($(SCHEDULER), MLFQ)
+  CFLAGS += -DUSE_MLFQ
+else ifeq ($(SCHEDULER), FCFS)
+  CFLAGS += -DUSE_FCFS
 else
   CFLAGS += -DUSE_RR
+endif
+
+# Scheduler comparison logging: off by default, so normal runs and grading stay clean. Pass
+# STATS=1 to print, on process exit, the timing data (ctime/first_run/etime/rtime/wtime) that
+# turnaround/waiting/response time are computed from, and under SCHEDULER=MLFQ also a per-tick
+# queue log for the timeline plot. This is debugging/measurement output, in the same spirit as
+# procdump, just automatic instead of triggered by Ctrl+P.
+ifdef STATS
+  CFLAGS += -DSCHED_STATS
 endif
 
 # Disable PIE when possible (for Ubuntu 16.10 toolchain)
@@ -158,6 +169,8 @@ UPROGS=\
 	$U/_forphan\
 	$U/_dorphan\
 	$U/_sync\
+	$U/_testfcfs\
+	$U/_schedulertest\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

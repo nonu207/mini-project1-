@@ -18,6 +18,7 @@
 typedef struct {
     pid_t pid;
     char  command_name[BG_NAME_MAX];
+    int   stopped;                  /* last reported state: 1 = stopped */
 } BgProc;
 
 /* One background job == one process group.  A standalone command is a
@@ -36,7 +37,7 @@ typedef struct {
     int    lead_status;             /* wait status of the lead */
     int    lead_reaped;             /* is lead_status valid yet? */
     int    last_status;             /* fallback if the lead was never reaped */
-    int    stopped;                 /* 1 once SIGTSTP suspended the group */
+    int    stopped;                 /* 1 while any process is stopped */
     int    nprocs;                  /* LIVE process count; 0 retires the job */
     BgProc procs[MAX_JOB_PROCS];
 } BgJob;
@@ -71,6 +72,11 @@ void bg_watch_pid(pid_t pid);
 int  bg_unwatch_pid(pid_t pid);
 
 int  run_bg_group(Token *start, HopEntry *db, int *db_size);
+
+/* In a background child, after setpgid: restore SIGTTIN/SIGTTOU so a
+   terminal read stops the job, and use /dev/null as stdin when the shell
+   has no terminal (so the job cannot read the shell's own input). */
+void bg_child_setup(void);
 
 /* Register a foreground job that Ctrl-Z just suspended.  Assigns the next
    job number and prints "[job_number] + Stopped command". */

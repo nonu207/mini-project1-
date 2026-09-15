@@ -53,10 +53,11 @@ static int fg_wait(pid_t pgid, pid_t *pids, char (*names)[BG_NAME_MAX],
   /* Spec: reclaim the terminal after the pipeline finishes OR stops. */
   term_take();
 
-  /* The job owns the terminal now, so ^C goes to it and never to the
-     shell -- the shell must therefore end the "^C" line itself, or the
-     next line of output runs on from it. */
-  if (interrupted) {
+  /* The job owned the terminal, so ^C/^Z went to it and never to the
+     shell -- the shell must therefore end the echoed "^C" or "^Z" line
+     itself, or the next output runs on from it ("^Z[1] + Stopped ...").
+     A stop is only echoed on a terminal. */
+  if (interrupted || (sn > 0 && term_is_tty())) {
     printf("\n");
     fflush(stdout);
   }
@@ -797,8 +798,8 @@ int execute_pipeline(Token *start) {
 
 /* ------------------------------------------------------------------ */
 /* execute_pipeline_bg: like execute_pipeline, but the parent does not */
-/* wait for children.  stdin of every child is /dev/null so the        */
-/* pipeline has no terminal access.  Returns pid of the first command. */
+/* wait for children.  bg_child_setup keeps the stages off terminal    */
+/* input (see bg.c).  Returns pid of the first command.                */
 /* ------------------------------------------------------------------ */
 /* ------------------------------------------------------------------ */
 /* record_bg_stage: remember one live pipeline stage for the job table. */
@@ -984,12 +985,7 @@ pid_t execute_pipeline_bg(Token *start, pid_t *out_pids,
       setpgid(0, pgid);
       /* Undo the SIGPIPE ignore above, which would survive execve. */
       signal(SIGPIPE, SIG_DFL);
-
-      int devnull = open("/dev/null", O_RDONLY);
-      if (devnull >= 0) {
-        dup2(devnull, STDIN_FILENO);
-        close(devnull);
-      }
+      bg_child_setup();
 
       if (i > 0)
         dup2(pipefds[i - 1][0], STDIN_FILENO);

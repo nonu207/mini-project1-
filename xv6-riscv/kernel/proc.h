@@ -118,4 +118,21 @@ struct proc {
   uint64 enq_time;             // Arrival stamp: smaller = closer to the front of the queue
   int ticks_used;              // Ticks used so far in the current time slice
 #endif
+
+  // Scheduler comparison bookkeeping. These fields exist under every scheduler (RR, FCFS and
+  // MLFQ), so the same measurements can be compared across all three on an identical workload.
+  // All four are tick counts taken from the global "ticks" variable in trap.c.
+  //   ctime          the tick this process was created in (set once, in allocproc())
+  //   first_run_time the tick it was first dispatched to RUNNING, or -1 if it never has been;
+  //                  first_run_time - ctime is its response time
+  //   etime          the tick it exited in, or -1 while it is still alive;
+  //                  etime - ctime is its turnaround time
+  //   rtime, wtime   ticks accumulated so far RUNNING and RUNNABLE respectively, counted once per
+  //                  tick in update_times() in proc.c; wtime is exactly the time spent waiting in
+  //                  the ready queue, since RUNNABLE is xv6's ready-queue state
+  int ctime;
+  int first_run_time;
+  int etime;
+  int rtime;
+  int wtime;
 };

@@ -86,9 +86,9 @@ int execute_pipeline(Token *start);
  * Execute a pipeline in the background (non-blocking).
  *
  * Forks all pipeline stages and sets up their inter-process pipes, then
- * returns WITHOUT waiting for any child to finish.  stdin of every child
- * in the pipeline is redirected to /dev/null so the pipeline has no
- * access to the terminal.
+ * returns WITHOUT waiting for any child to finish.  The stages never own
+ * the terminal: on a tty a terminal read stops them with SIGTTIN, and
+ * without a tty their stdin is /dev/null (see bg_child_setup).
  *
  * Every stage is placed in ONE process group headed by the first stage, so
  * that terminal-generated signals never reach it and so that activities can

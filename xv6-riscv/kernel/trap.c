@@ -187,6 +187,17 @@ clockintr()
     ticks++;
     wakeup(&ticks);
     release(&tickslock);
+    // MLFQ priority boost every 48 ticks. The global tick counter only goes up here, on CPU 0, so
+    // this check runs exactly once per tick for the whole system, and on every 48th tick
+    // mlfq_boost() moves all processes back to queue 0. Reading ticks after releasing the lock is
+    // safe: only this code on CPU 0 changes it, and we are still inside the same interrupt.
+#ifdef USE_MLFQ
+    if (ticks % 48 == 0)
+      mlfq_boost();
+#endif
+    // Scheduler comparison accounting, every tick, for every scheduler. Same reasoning as the
+    // boost check above: this runs exactly once per tick for the whole system.
+    update_times();
   }
 
   // ask for the next timer interrupt. this also clears

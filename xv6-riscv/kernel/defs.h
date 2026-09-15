@@ -104,7 +104,12 @@ void            yield(void);
 // exists in the MLFQ build.
 #ifdef USE_MLFQ
 void            mlfq_tick(void);
+// mlfq_boost() moves every process back to queue 0; clockintr() calls it every 48 ticks.
+void            mlfq_boost(void);
 #endif
+// update_times() runs once per tick, for every scheduler, to accumulate each process's running and
+// waiting time and (under MLFQ with SCHED_STATS) log its current queue. See proc.c for details.
+void            update_times(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);

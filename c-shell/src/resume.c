@@ -15,26 +15,27 @@ static void alarm_handler(int sig) {
 }
 
 /* ------------------------------------------------------------------ */
-/* parse_job_number: accept "%3" or "3".  Returns 0 if not a positive   */
-/* integer.                                                             */
+/* parse_job_number: the spec syntax is "%job_number", so accept only   */
+/* '%' followed by decimal digits.  Returns the number, or -1 if the    */
+/* syntax is wrong.  "%0" or a huge number is well formed: it simply    */
+/* names no job, which the caller reports as "no such job".             */
 /* ------------------------------------------------------------------ */
 static int parse_job_number(const char *s) {
-  if (s == NULL)
-    return 0;
-  if (*s == '%')
-    s++;
+  if (s == NULL || *s != '%')
+    return -1;
+  s++;
   if (*s == '\0')
-    return 0;
+    return -1;
 
   int value = 0;
   for (const char *p = s; *p != '\0'; p++) {
     if (!isdigit((unsigned char)*p))
-      return 0;
-    value = value * 10 + (*p - '0');
-    if (value > 1000000)
-      return 0;
+      return -1;
+    /* Past any real job number: stop growing, so it cannot overflow. */
+    if (value <= 1000000)
+      value = value * 10 + (*p - '0');
   }
-  return value;                     /* 0 is rejected: jobs start at 1 */
+  return value;
 }
 
 /* ------------------------------------------------------------------ */
@@ -138,6 +139,8 @@ static void resume_fg(const BgJob *job, int timeout_secs) {
       if (r > 0) {
         if (WIFSTOPPED(status))
           stopped[sn++] = pids[i];
+        else
+          pids[i] = 0;              /* exited and reaped */
         break;
       }
       if (r < 0 && errno == EINTR) {
@@ -148,6 +151,7 @@ static void resume_fg(const BgJob *job, int timeout_secs) {
         }
         continue;                   /* a background SIGCHLD; keep waiting */
       }
+      pids[i] = 0;
       break;                        /* ECHILD: already reaped */
     }
   }
@@ -160,18 +164,17 @@ static void resume_fg(const BgJob *job, int timeout_secs) {
 
   if (timed_out) {
     kill(-pgid, SIGTERM);
-    /* Reap the terminated group so it leaves no zombies.  The job is
-       gone from the table, so check_bg_jobs would not match these. */
-    for (int i = 0; i < n; i++) {
-      int status;
-      if (pids[i] > 0)
-        while (waitpid(pids[i], &status, 0) < 0 && errno == EINTR)
-          ;
-    }
+    /* Do not wait for the group to die here: a job that ignores SIGTERM
+       would hang the shell forever.  Reclaim the terminal and report now. */
     term_take();
     fprintf(stderr, "resume: job timed out\n");
-    /* Spec: a timed out job has been terminated, so drop it. */
+    /* Spec: a timed out job has been terminated, so drop it.  Its
+       processes still need reaping once they exit, so hand the live ones
+       back to the SIGCHLD handler; with no job owning them any more, they
+       are reaped silently. */
     bg_remove_job(job_number);
+    for (int i = 0; i < n; i++)
+      bg_watch_pid(pids[i]);        /* ignores the 0s already reaped */
     return;
   }
 
@@ -180,6 +183,8 @@ static void resume_fg(const BgJob *job, int timeout_secs) {
   /* Spec: only stopped jobs stay in the list. */
   if (sn > 0) {
     bg_set_stopped(job_number, stopped, sn);
+    if (term_is_tty())
+      printf("\n");                 /* end the echoed "^Z" line */
     printf("[%d] + Stopped %s\n", job_number, cmdline);
     fflush(stdout);
   } else {
@@ -198,7 +203,7 @@ void resume(int argc, char **argv) {
   }
 
   int job_number = parse_job_number(argv[1]);
-  if (job_number <= 0) {
+  if (job_number < 0) {
     fprintf(stderr, "resume: invalid syntax\n");
     return;
   }

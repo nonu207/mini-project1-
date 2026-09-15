@@ -54,7 +54,14 @@ static int read_input_line(char *input, size_t size) {
         return 0;                       /* buffer full; run what we have */
       if (feof(stdin)) {
         clearerr(stdin);
-        return (len == 0) ? -1 : 0;
+        if (len == 0)
+          return -1;
+        /* Spec: Ctrl-D on typed text keeps the text and stays alive, so
+           on a terminal read on until Enter.  Only piped input whose last
+           line has no newline runs that line. */
+        if (term_is_tty())
+          continue;
+        return 0;
       }
       continue;                         /* partial line: keep the text */
     }
@@ -62,7 +69,11 @@ static int read_input_line(char *input, size_t size) {
     if (feof(stdin)) {
       clearerr(stdin);
       /* Ctrl-D counts as EOF only on an empty line. */
-      return (len == 0) ? -1 : 0;
+      if (len == 0)
+        return -1;
+      if (term_is_tty())
+        continue;                       /* keep the typed text (see above) */
+      return 0;
     }
 
     if (errno == EINTR) {
@@ -132,6 +143,10 @@ int main(void) {
     int read_status = read_input_line(input, sizeof(input));
     if (read_status < 0) {
       printf("\n");
+      /* Apply any stop the SIGCHLD handler has queued but not yet
+         reported, so a job stopped from outside (kill -STOP, or a
+         background read of the terminal) also counts as Stopped. */
+      check_bg_jobs();
       if (!eof_pending && bg_has_stopped()) {
         fprintf(stderr, "cshell: there are stopped jobs\n");
         eof_pending = 1;
