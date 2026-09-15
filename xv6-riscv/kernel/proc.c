@@ -1005,6 +1005,8 @@ procdump(void)
   printk("\n");
 #ifdef USE_MLFQ
   printk("scheduler=MLFQ ticks=%u since_boost=%u/48\n", ticks, ticks % 48);
+#elif defined(USE_FCFS)
+  printk("scheduler=FCFS ticks=%u\n", ticks);
 #else
   printk("scheduler=RR ticks=%u\n", ticks);
 #endif
